@@ -1,6 +1,3 @@
-Here's a complete README for reinstallation. Save it somewhere safe.
-
-```markdown
 # XDJ-RX3 Firmware Emulation on Lenovo Duet 1
 
 Running the Pioneer XDJ-RX3 v1.19 ARM32 firmware on a Lenovo Duet 1
