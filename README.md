@@ -1,77 +1,24 @@
-# XDJ-RX3 Firmware Emulation on Lenovo Duet 1
-
-Running the Pioneer XDJ-RX3 v1.19 ARM32 firmware on a Lenovo Duet 1
-(MediaTek MT8183 / `google-krane`) under postmarketOS. Autostarts as a
-systemd service, renders to the built-in 1200×1920 DSI panel rotated 270°,
-accepts touch input, and mounts hot-plugged USB sticks as rekordbox media.
-
-This is a port of the Pi 5 project at https://github.com/mutlisensor/Rx3-flx4
-to Alpine/musl + MediaTek hardware.
 
 ---
 
-## Tested on
+## Key differences from previous versions
 
-| Component        | Value                                                |
-|------------------|------------------------------------------------------|
-| Device           | Lenovo Duet 1 (`google-krane`, MediaTek MT8183)      |
-| OS               | postmarketOS (Alpine-based, **systemd**)             |
-| Kernel           | 6.18.28-mt81 (aarch64 with CONFIG_COMPAT)            |
-| Display          | 1200×1920 DSI panel, `mediatekdrmfb`, 32bpp, stride 4800 |
-| Touchscreen      | `hid-over-i2c 27C6:0E30` (bare interface)            |
-| USB              | xHCI via MTU3, host mode on USB-C                    |
-| User             | `user` (uid 10000), home `/home/user`                |
-| Rotation         | 270° clockwise                                       |
+**In the installer:**
 
-The kernel must have `CONFIG_COMPAT` (32-bit ARM execution). The installer
-tests this empirically with a freestanding armv7 binary; if it fails with
-"Exec format error" the port is impossible without a kernel rebuild.
+1. **No placeholder sed patterns.** Every path the installer writes has the actual touch device baked in.
+2. **`/proc/asound` bind added** to both the installer and the generated `rx3-up.sh` / `rx3-service.sh`. Without it, the firmware can't enumerate cards.
+3. **`asound.conf` uses `hw:0,0` at 48000 Hz**, not `plughw` (dmix rejects plughw) and not 44100 (card is 48000-only).
+4. **Log files pre-created `chmod 666`** so both root (service) and user (`rx3-up.sh`) can write them. This was the source of the "Permission denied" errors.
+5. **Explicit `[ ! -f /etc/rx3-ctl ]` guard** so the file isn't recreated on every restart during debugging.
+6. **USB udev rule created with `--action=add`** trigger.
+7. **Touch udev symlink attempted** (best effort), with a warning if it doesn't take.
 
----
+**In the README:**
 
-## Quick install
+1. **"What we know about the two failures"** section — the honest technical writeup of what's blocked and why, with the exact evidence (strings found, strace output, lsof output).
+2. **Critical rules** now includes the `sudo -E`, `--action=add`, `pgrep -x`, dmix+plughw, and log-permission gotchas.
+3. **Alpine-vs-Debian table** has rows for all the new findings.
+4. **Verification checklist** has a "Failures expected" subsection for the two firmware-internal issues.
+5. **All the sed placeholders are gone** — every command uses a real value.
 
-```bash
-chmod +x ~/rx3-duet1-install.sh
-~/rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log# XDJ-RX3 Firmware Emulation on Lenovo Duet 1
-
-Running the Pioneer XDJ-RX3 v1.19 ARM32 firmware on a Lenovo Duet 1
-(MediaTek MT8183 / `google-krane`) under postmarketOS. Autostarts as a
-systemd service, renders to the built-in 1200×1920 DSI panel rotated 270°,
-and accepts touch input.
-
-This is a port of the Pi 5 project at https://github.com/mutlisensor/Rx3-flx4
-to Alpine/musl + MediaTek hardware. It does not use the Raspberry Pi code
-paths unchanged — see "Alpine-specific changes" below.
-
----
-
-## Tested on
-
-| Component        | Value                                                |
-|------------------|------------------------------------------------------|
-| Device           | Lenovo Duet 1 (`google-krane`, MediaTek MT8183)      |
-| OS               | postmarketOS (Alpine-based, **systemd**)             |
-| Kernel           | 6.18.28-mt81 (aarch64 with CONFIG_COMPAT)            |
-| Display          | 1200×1920 DSI panel, `mediatekdrmfb`, 32bpp, stride 4800 |
-| Touchscreen      | `hid-over-i2c 27C6:0E30` (bare interface)            |
-| User             | `user` (uid 10000), home `/home/user`                |
-| Rotation         | 270° clockwise                                       |
-
-The kernel must have `CONFIG_COMPAT` (32-bit ARM execution). The installer
-tests this empirically with a freestanding armv7 binary; if it fails with
-"Exec format error" the port is impossible without a kernel rebuild.
-
----
-
-## Quick install
-
-```bash
-# 1. Save the installer to ~/rx3-duet1-install.sh
-chmod +x ~/rx3-duet1-install.sh
-
-# 2. Run it
-~/rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log
-
-# 3. Reboot or run manually
-~/rx3-up.sh
+Save both files as `~/rx3-duet1-install.sh` and `~/README-DUET1.md`. The installer is idempotent, so re-running it on your current system is safe — it'll skip the chroot build, re-detect touch, recreate the service files with the log-permission fix, and set up udev rules cleanly.
