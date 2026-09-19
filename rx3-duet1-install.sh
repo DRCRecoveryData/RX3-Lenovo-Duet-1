@@ -1,464 +1,455 @@
+cat > ~/rx3-duet1-install.sh <<'INSTALL_EOF'
 #!/bin/bash
-# rx3-duet1-install.sh
-# All-in-one installer for XDJ-RX3 firmware emulation on Lenovo Duet 1
-# (MediaTek MT8183 / google-krane) under postmarketOS / Alpine + systemd.
+# rx3-duet1-install.sh — XDJ-RX3 firmware emulation on Lenovo Duet 1
+# (MediaTek MT8183 / google-krane, postmarketOS / Alpine + systemd).
+# Native ARM32 via CONFIG_COMPAT — no QEMU.
 #
-# Run as your normal user (NOT root). The script will sudo where needed.
+# Features: 1200x1920 portrait @ rotation 270, touch overlay buttons,
+# swipe-up to show overlay (auto-hides after 8s), USB hotplug, autostart.
 #
-# Usage:  bash rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log
+# Run as your normal user (NOT root). Idempotent.
+# Usage: bash ~/rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log
 
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-REPO_URL="https://github.com/mutlisensor/Rx3-flx4.git"
-WORKDIR="$HOME/Rx3-flx4"
-HANDOFF="$WORKDIR/rx3-handoff"
-ROOTFS="$HOME/rx3-rootfs"
-ROTATION=270
+REPO="https://github.com/mutlisensor/Rx3-flx4.git"
+W="$HOME/Rx3-flx4"
+H="$W/rx3-handoff"
+R="$HOME/rx3-rootfs"
+ROT=270
 TOUCH_NAME="hid-over-i2c 27C6:0E30"
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[!] %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31m[FATAL] %s\033[0m\n' "$*" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# Step 0 — sanity
-# ---------------------------------------------------------------------------
-[ "$(id -u)" -ne 0 ] || die "Do not run as root. Run as your normal user; the script will sudo when needed."
-[ -n "${HOME:-}" ] && [ -d "$HOME" ] || die "\$HOME not set or missing."
-command -v apk >/dev/null || die "apk not found. This installer targets Alpine/postmarketOS."
-command -v systemctl >/dev/null || die "systemd not found. This installer assumes systemd."
+# --- 0. sanity ---
+[ "$(id -u)" -ne 0 ] || die "Do not run as root"
+[ -n "${HOME:-}" ] && [ -d "$HOME" ] || die "HOME unset"
+command -v apk >/dev/null || die "apk not found — postmarketOS/Alpine required"
+command -v systemctl >/dev/null || die "systemd not found"
 
-say "Installing on host: $(uname -a)"
-say "User: $(id -un) (uid $(id -u)), HOME=$HOME"
+say "Duet 1 RX3 installer"
+echo "    Host: $(uname -srm)"
+echo "    User: $(id -un) (uid $(id -u))"
+echo "    fb:   $(cat /sys/class/graphics/fb0/name 2>/dev/null) $(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)"
 
-# ---------------------------------------------------------------------------
-# Step 1 — APK packages
-# ---------------------------------------------------------------------------
+# --- 1. packages ---
 say "Installing Alpine packages"
 sudo apk add --no-cache \
-    git bash \
-    build-base gcc g++ make patch linux-headers binutils \
+    git bash build-base gcc g++ make patch linux-headers binutils \
     gcc-armv7 binutils-armv7 musl-armv7 musl-dev-armv7 libstdc++-dev-armv7 \
     fuse-overlayfs exfatprogs alsa-utils \
-    py3-pillow py3-cryptography \
-    rsync 7zip \
+    py3-pillow py3-cryptography rsync 7zip \
     freetype-dev pkgconf font-dejavu libpng-dev \
     strace lsof coreutils
 
-# ---------------------------------------------------------------------------
-# Step 2 — armv7 toolchain symlinks
-# ---------------------------------------------------------------------------
-say "Setting up armv7 cross-toolchain symlinks"
+# --- 2. armv7 toolchain symlinks ---
+say "Symlinking armv7 toolchain to arm-linux-gnueabi-*"
 sudo mkdir -p /usr/local/bin
-for tool in gcc nm objdump; do
-    src="/usr/bin/armv7-alpine-linux-musleabihf-${tool}"
-    dst="/usr/local/bin/arm-linux-gnueabi-${tool}"
-    [ -x "$src" ] || die "Missing $src — is gcc-armv7 installed?"
+for t in gcc nm objdump; do
+    src="/usr/bin/armv7-alpine-linux-musleabihf-${t}"
+    dst="/usr/local/bin/arm-linux-gnueabi-${t}"
+    [ -x "$src" ] || die "missing $src"
     sudo ln -sf "$src" "$dst"
 done
 arm-linux-gnueabi-gcc --version | head -1
 
-# ---------------------------------------------------------------------------
-# Step 3 — uapi headers into armv7 sysroot
-# ---------------------------------------------------------------------------
+# --- 3. kernel uapi headers into armv7 sysroot ---
 say "Symlinking kernel uapi headers into armv7 sysroot"
-SYSROOT=/usr/armv7-alpine-linux-musleabihf/include
-[ -d "$SYSROOT" ] || die "armv7 sysroot not found at $SYSROOT"
+SYS=/usr/armv7-alpine-linux-musleabihf/include
+[ -d "$SYS" ] || die "armv7 sysroot not found at $SYS"
 for h in asm asm-generic linux; do
-    sudo ln -sf "/usr/include/$h" "$SYSROOT/$h"
+    sudo ln -sf "/usr/include/$h" "$SYS/$h"
 done
 
-# ---------------------------------------------------------------------------
-# Step 4 — empirical 32-bit ARM test
-# ---------------------------------------------------------------------------
+# --- 4. 32-bit ARM test ---
 say "Testing 32-bit ARM execution"
 cat > /tmp/t32.c <<'EOF'
-void _start(void) {
-    __asm__ volatile ("mov r7, #1\nmov r0, #42\nsvc #0\n");
-    for(;;);
-}
+void _start(void){__asm__ volatile ("mov r7,#1\nmov r0,#42\nsvc #0\n");for(;;);}
 EOF
 armv7-alpine-linux-musleabihf-gcc -nostdlib -static -o /tmp/t32 /tmp/t32.c
-set +e
-/tmp/t32; rc=$?
-set -e
-[ "$rc" = "42" ] || die "Kernel cannot run 32-bit ARM (exit=$rc). CONFIG_COMPAT is required — rebuild the kernel."
-echo "    32-bit ARM OK (exit code 42)"
+set +e; /tmp/t32; rc=$?; set -e
+[ "$rc" = "42" ] || die "kernel cannot run 32-bit ARM (exit=$rc)"
+echo "    32-bit ARM OK"
 
-# ---------------------------------------------------------------------------
-# Step 5 — clone & patch repo
-# ---------------------------------------------------------------------------
-if [ -d "$WORKDIR/.git" ]; then
-    say "Repo already present at $WORKDIR — pulling"
-    git -C "$WORKDIR" pull --ff-only || warn "git pull failed; continuing with local copy"
+# --- 5. clone ---
+say "Cloning repo"
+if [ -d "$W/.git" ]; then
+    git -C "$W" pull --ff-only || warn "pull failed; using local copy"
 else
-    say "Cloning $REPO_URL"
-    git clone "$REPO_URL" "$WORKDIR"
+    git clone "$REPO" "$W"
 fi
-cd "$HANDOFF" || die "No rx3-handoff dir in $WORKDIR"
+cd "$H"
+chmod +x *.sh
 
-say "Making handoff scripts executable"
-chmod +x "$HANDOFF"/*.sh
+# --- 6. patch all C/Python source with one script ---
+say "Patching sources (patch-player.py, control-shim.c, fb-present.c, touch-bridge.c, pi-controls.h, rx3-control.py, usb-attach.sh, usb-hotplug.sh, build-rootfs.sh)"
 
-say "Patching build-rootfs.sh for Alpine sysroot"
-sed -i 's|arm-linux-gnueabi-gcc -shared -fPIC|arm-linux-gnueabi-gcc --sysroot=/usr/armv7-alpine-linux-musleabihf -shared -fPIC|' build-rootfs.sh
-sed -i 's|apt install gcc-arm-linux-gnueabi|apk add gcc-armv7 musl-dev-armv7|' build-rootfs.sh
+python3 - <<'PYEOF'
+from pathlib import Path
+import re, sys
 
-say "Patching patch-player.py (getPcController NULL fix)"
-if ! grep -q "31df70" patch-player.py; then
-    sed -i "s|(b/'rbp-pi').write_bytes(p)|# getPcController: return NULL instead of deref'ing a NULL singleton (JuceTimer fires before init).\nwords(0x31df70,0xe3a00000)\n(b/'rbp-pi').write_bytes(p)|" patch-player.py
-fi
-grep -q '31df70' patch-player.py || die "patch-player.py patch failed"
+H = Path.home() / "Rx3-flx4/rx3-handoff"
+def edit(name, patches):
+    p = H / name
+    if not p.exists(): print(f"  ! {name} missing"); return
+    s = p.read_text(); n = 0
+    for tag, old, new in patches:
+        if new in s and old not in s:
+            n += 1; continue
+        if old in s:
+            s = s.replace(old, new, 1); n += 1
+        else:
+            print(f"    MISS: {name}:{tag}")
+    p.write_text(s)
+    print(f"  {name}: {n}/{len(patches)}")
 
-say "Patching usb-hotplug.sh (pgrep -x → -f: pgrep -x never matches the chroot-wrapped player)"
-if grep -q 'pgrep -x rbp-pi' usb-hotplug.sh; then
-    sed -i 's|pgrep -x rbp-pi|pgrep -f rbp-pi|' usb-hotplug.sh
-    echo "    patched"
+# ---- patch-player.py: add getPcController NULL fix ----
+p = H / "patch-player.py"
+if p.exists():
+    s = p.read_text()
+    if "31df70" not in s:
+        old = "(b/'rbp-pi').write_bytes(p)"
+        new = "words(0x31df70,0xe3a00000)\n(b/'rbp-pi').write_bytes(p)"
+        if old in s:
+            p.write_text(s.replace(old, new, 1))
+            print("  patch-player.py: patched")
+        else:
+            print("    MISS: patch-player.py: write_bytes line")
+    else:
+        print("  patch-player.py: already patched")
+
+# ---- build-rootfs.sh: Alpine sysroot + apk deps ----
+p = H / "build-rootfs.sh"
+if p.exists():
+    s = p.read_text()
+    s = s.replace(
+        "arm-linux-gnueabi-gcc -shared -fPIC",
+        "arm-linux-gnueabi-gcc --sysroot=/usr/armv7-alpine-linux-musleabihf -shared -fPIC")
+    s = s.replace(
+        "apt install gcc-arm-linux-gnueabi",
+        "apk add gcc-armv7 musl-dev-armv7")
+    p.write_text(s)
+    print("  build-rootfs.sh: patched")
+
+# ---- control-shim.c: refresh_manager gate fix ----
+edit("control-shim.c", [
+    ("gate_thread",
+     "static void *control_thread(void *unused){\n sleep(3);",
+     ("static volatile void *g_manager = 0;\n"
+      "static void refresh_manager(void){\n"
+      " void *m=0;void *root=*(void *volatile *)0x026867c0;\n"
+      " if(root)m=*(void **)((char*)root+0x64);\n"
+      " if(m){((void (*)(void*,int))0x37c8d8)(m,3);g_manager=m;}\n"
+      "}\n"
+      "static void *gate_thread(void *unused){\n"
+      " sleep(5);\n"
+      " for(;;){refresh_manager();sleep(10);}\n"
+      " return 0;\n"
+      "}\n"
+      "static void *control_thread(void *unused){\n sleep(3);")),
+    ("gate_spawn",
+     " ((void (*)(void*,int))0x37c8d8)(manager,3);\n void (*sendkey)",
+     (" ((void (*)(void*,int))0x37c8d8)(manager,3);\n"
+      " unsigned long t2;pthread_create(&t2,0,gate_thread,0);\n"
+      " void (*sendkey)")),
+    ("refresh_loop",
+     "  sendkey(manager,c.key,c.operation,c.channel,c.value,c.analog,c.extra);",
+     ("  refresh_manager();\n"
+      "  void *m=g_manager?g_manager:manager;\n"
+      "  sendkey(m,c.key,c.operation,c.channel,c.value,c.analog,c.extra);")),
+])
+
+# ---- pi-controls.h: add overlay_visible ----
+edit("pi-controls.h", [
+    ("overlay_visible",
+     "int cursor_x,cursor_y,cursor_visible;};",
+     "int cursor_x,cursor_y,cursor_visible;int overlay_visible;};"),
+])
+
+# ---- fb-present.c: add -hidable flag + toggle ----
+edit("fb-present.c", [
+    ("flag_parse",
+     " if(argc<2)return 2;\n const char*fbpath=argc>2?argv[2]:fb_device();",
+     (" int noborder=0,hidable=0;\n"
+      " while(argc>1&&argv[1][0]=='-'){\n"
+      "  if(!strcmp(argv[1],\"-noborder\")){noborder=1;argc--;argv++;continue;}\n"
+      "  if(!strcmp(argv[1],\"-hidable\")){hidable=1;argc--;argv++;continue;}\n"
+      "  break;\n"
+      " }\n"
+      " if(argc<2)return 2;\n"
+      " const char*fbpath=argc>2?argv[2]:fb_device();")),
+    ("loop_header",
+     (" for(;;){\n"
+      " memcpy(frame,chrome,sizeof(frame));\n"
+      " for(int y=0;y<1000;y++){int sy=y*4/5;for(int x=0;x<1600;x++)frame[y*1920+x+160]=s[sy*1280+x*4/5];}\n"),
+     (" int _lb=-1;\n"
+      " for(;;){\n"
+      " int draw_border = !noborder && (!hidable || state->overlay_visible);\n"
+      " if(draw_border!=_lb){\n"
+      "  if(draw_border){for(int py=0;py<H;py++)for(int px=0;px<W;px++){int cx,cy;idx[py*W+px]=panel_to_canvas(&L,px,py,0,&cx,&cy)?cy*1920+cx:-1;}}\n"
+      "  else{for(int py=0;py<H;py++)for(int px=0;px<W;px++){int su=px*1200/W,sv=py*1920/H;int cx,cy;\n"
+      "   switch(L.rot){case 90:cx=sv;cy=1199-su;break;case 180:cx=1919-su;cy=1199-sv;break;case 270:cx=1919-sv;cy=su;break;default:cx=su;cy=sv;}\n"
+      "   if(cx<0)cx=0;if(cx>1919)cx=1919;if(cy<0)cy=0;if(cy>1199)cy=1199;idx[py*W+px]=cy*1920+cx;}\n"
+      "  }\n"
+      "  _lb=draw_border;\n"
+      " }\n"
+      " if(draw_border)memcpy(frame,chrome,sizeof(frame));else memset(frame,0,sizeof(frame));\n"
+      " if(draw_border){for(int y=0;y<1000;y++){int sy=y*4/5;for(int x=0;x<1600;x++)frame[y*1920+x+160]=s[sy*1280+x*4/5];}}\n"
+      " else{for(int y=0;y<1200;y++){int sy=y*2/3;for(int x=0;x<1920;x++)frame[y*1920+x]=s[sy*1280+x*2/3];}}\n")),
+    ("button_open",
+     " for(int i=0;i<12;i++)if(state->pressed&(1u<<i))drawbutton(i,1);\n",
+     " if(draw_border){\n for(int i=0;i<12;i++)if(state->pressed&(1u<<i))drawbutton(i,1);\n"),
+    ("button_close",
+     ' char val[24];snprintf(val,sizeof(val),"%d%%",(int)(n*100+.5));label(x+80,y+305,val,25,0xd1dae2);}\n',
+     ' char val[24];snprintf(val,sizeof(val),"%d%%",(int)(n*100+.5));label(x+80,y+305,val,25,0xd1dae2);}\n }\n'),
+])
+
+# ---- touch-bridge.c: swipe-up + auto-hide ----
+edit("touch-bridge.c", [
+    ("struct",
+     "struct finger {int x,y,down,active,region;long next_repeat;};",
+     "struct finger {int x,y,down,active,region;long next_repeat;long t_start;int y_start,y_min,y_max;};"),
+    ("global",
+     "static long millis(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000+t.tv_nsec/1000000;}",
+     "static long millis(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000+t.tv_nsec/1000000;}\nstatic long overlay_last_touch=0;"),
+    ("state_init",
+     " if(state->magic!=0x52583332)*state=(struct ui_state){0x52583332,{1,.6,0,1,.5,.5},0,1};",
+     " if(state->magic!=0x52583332)*state=(struct ui_state){0x52583332,{1,.6,0,1,.5,.5},0,1};\n state->overlay_visible=1;overlay_last_touch=millis();"),
+    ("finger_down",
+     "  if(f->down&&!f->active){f->active=1;f->region=-1;",
+     "  if(f->down&&!f->active){f->active=1;f->region=-1;f->t_start=now;f->y_start=ly;f->y_min=ly;f->y_max=ly;"),
+    ("track",
+     "   else if(f->region==0){ux=(lx-160)*4/5;uy=ly*4/5;if(ux<0)ux=0;if(ux>1279)ux=1279;if(uy<0)uy=0;if(uy>799)uy=799;}\n",
+     "   else if(f->region==0){ux=(lx-160)*4/5;uy=ly*4/5;if(ux<0)ux=0;if(ux>1279)ux=1279;if(uy<0)uy=0;if(uy>799)uy=799;}\n   if(ly<f->y_min)f->y_min=ly;if(ly>f->y_max)f->y_max=ly;\n"),
+    ("release",
+     "  if(f->active&&!f->down){if(f->region>0&&f->region<=12)button(f->region-1,0);if(source==i){source=-1;release=10;}f->active=0;}",
+     ("  if(f->active&&!f->down){if(f->region>0&&f->region<=12)button(f->region-1,0);if(source==i){source=-1;release=10;}"
+      "int dy=f->y_max-f->y_min;int dt=(int)(now-f->t_start);"
+      "if(dy>250&&dt<700){state->overlay_visible=1;overlay_last_touch=now;}f->active=0;}")),
+    ("timer",
+     " long now=millis();\n for(int i=0;i<10;i++){",
+     (" long now=millis();\n"
+      " {int anydown=0;for(int i=0;i<10;i++)if(fingers[i].down){anydown=1;break;}\n"
+      "  if(anydown&&state->overlay_visible)overlay_last_touch=now;\n"
+      "  if(state->overlay_visible&&overlay_last_touch&&(now-overlay_last_touch)>8000)state->overlay_visible=0;}\n"
+      " for(int i=0;i<10;i++){")),
+])
+
+# ---- rx3-control.py: op=0 for Duet ----
+p = H / "rx3-control.py"
+if p.exists():
+    s = p.read_text()
+    if "send(k,1,ch)" in s:
+        s = s.replace("send(k,1,ch)", "send(k,0,ch)", 1)
+        p.write_text(s)
+        print("  rx3-control.py: op=1 -> op=0 (Duet)")
+    else:
+        print("  rx3-control.py: op=0 already")
+
+# ---- usb-attach.sh: mknod hex->decimal ----
+edit("usb-attach.sh", [
+    ("mknod",
+     'mknod $R/dev/$PART b 0x$(stat -c %t "$SRC") 0x$(stat -c %T "$SRC")',
+     'mknod $R/dev/$PART b $((16#$(stat -c %t "$SRC"))) $((16#$(stat -c %T "$SRC")))'),
+])
+
+# ---- usb-hotplug.sh: retry mount event ----
+p = H / "usb-hotplug.sh"
+if p.exists():
+    if not (H / "usb-hotplug.sh.orig").exists():
+        (H / "usb-hotplug.sh.orig").write_text(p.read_text())
+    s = p.read_text()
+    if "mount event sent" not in s:
+        old = '''    $H/usb-attach.sh "$DEV" $PORT 9>&- && sudo -u $RX3_USER python3 $H/rx3-control.py mount $PORT /media/$PORT/$PART 9>&-
+    logger -t rx3 "$PORT attached $DEV" ;;'''
+        new = '''    if $H/usb-attach.sh "$DEV" $PORT 9>&-; then
+        ok=0
+        for i in $(seq 1 15); do
+            if sudo -u "$RX3_USER" python3 $H/rx3-control.py mount $PORT /media/$PORT/$PART 9>&-; then
+                ok=1; break
+            fi
+            sleep 1
+        done
+        logger -t rx3 "$PORT attached $DEV (mount event sent=$ok)"
+    else
+        logger -t rx3 "$PORT usb-attach FAILED"
+    fi ;;'''
+        if old in s:
+            p.write_text(s.replace(old, new, 1))
+            print("  usb-hotplug.sh: patched")
+        else:
+            print("    MISS: usb-hotplug.sh write_bytes line")
+    else:
+        print("  usb-hotplug.sh: already patched")
+
+print("  all source patches done")
+PYEOF
+
+# --- 7. firmware recovery ---
+if [ -f "$H/runtime-symlinks.json" ]; then
+    say "Firmware already extracted"
 else
-    echo "    already patched (or pattern not found)"
-fi
-
-say "Rewriting asound.conf for Duet's internal 2-channel MediaTek card"
-[ -f asound.conf.orig ] || cp asound.conf asound.conf.orig
-cat > asound.conf <<'EOF'
-# Duet 1: internal MediaTek card is 2-channel 48 kHz only.
-# dmix rejects plughw slaves; hw:0,0 must be the slave. Rate 48000 matches
-# the hardware exactly (aplay --dump-hw-params reports RATE: 48000, singular).
-pcm.rx3mix {
- type dmix
- ipc_key 5396531
- ipc_key_add_uid true
- slave {
-  pcm "hw:0,0"
-  format S16_LE
-  rate 48000
-  channels 2
- }
- bindings { 0 0 1 1 }
-}
-pcm.rx3out { type plug  slave.pcm "rx3mix" }
-pcm.rx3cue { type plug  slave.pcm "rx3mix" }
-EOF
-
-# ---------------------------------------------------------------------------
-# Step 6 — recover & extract firmware
-# ---------------------------------------------------------------------------
-if [ -f "$HANDOFF/runtime-symlinks.json" ]; then
-    say "Firmware already extracted (runtime-symlinks.json present) — skipping"
-else
-    say "Recovering firmware (downloads from AlphaTheta and decrypts)"
-    warn "recover-firmware.py is interactive. If it hangs, Ctrl+C and run it"
-    warn "manually from $HANDOFF, then re-run this installer."
+    say "Recovering firmware (interactive)"
+    warn "Have XDJ-RX3 v1.19 update + Pioneer GPL source .zip ready"
     python3 recover-firmware.py || die "recover-firmware.py failed"
     python3 extract_cramfs.py 2>&1 | tee /tmp/extract.log
-    grep -q "Extraction complete." /tmp/extract.log || die "extract_cramfs.py did not finish"
-    [ -f "$HANDOFF/runtime-symlinks.json" ] || die "runtime-symlinks.json missing — extraction incomplete"
+    grep -q "Extraction complete." /tmp/extract.log || die "extract_cramfs.py incomplete"
 fi
 
-# ---------------------------------------------------------------------------
-# Step 7 — build chroot
-# ---------------------------------------------------------------------------
-if [ -f "$ROOTFS/etc/rx3-ctl" ] && [ -d "$ROOTFS/root/pdj" ]; then
-    say "Chroot already built ($(du -sh "$ROOTFS" 2>/dev/null | cut -f1)) — skipping build"
+# --- 8. build chroot ---
+say "Building chroot"
+if [ -f "$R/etc/rx3-ctl" ] && [ -d "$R/root/pdj" ]; then
+    echo "    already built"
 else
-    say "Building the chroot (this takes a few minutes)"
-    if mount | grep -q "$ROOTFS"; then
-        warn "Stale mounts on $ROOTFS detected — unmounting first"
-        mapfile -t MOUNTS < <(mount | awk -v r="$ROOTFS" 'index($3, r) == 1 {print $3}' | sort -r)
-        for m in "${MOUNTS[@]}"; do
-            sudo umount -l -- "$m" 2>/dev/null || sudo umount -f -- "$m" 2>/dev/null || true
-        done
-    fi
-    ./build-rootfs.sh 2>&1 | tee /tmp/build-rootfs.log
-    grep -q '^== done' /tmp/build-rootfs.log || die "build-rootfs.sh did not finish — check /tmp/build-rootfs.log"
+    for m in $(mount | awk -v r="$R" 'index($3,r)==1{print $3}' | sort -r); do
+        sudo umount -l "$m" 2>/dev/null || sudo umount -f "$m" 2>/dev/null || true
+    done
+    ./build-rootfs.sh 2>&1 | tee /tmp/build.log
+    grep -q '^== done' /tmp/build.log || die "build-rootfs.sh failed"
 fi
-say "Chroot size: $(du -sh "$ROOTFS" 2>/dev/null | cut -f1)"
+say "    size: $(du -sh "$R" 2>/dev/null | cut -f1)"
 
-# ---------------------------------------------------------------------------
-# Step 8 — runtime files & mounts
-# ---------------------------------------------------------------------------
+# --- 9. runtime files ---
 say "Writing chroot runtime files"
-echo "hw:0" | sudo tee "$ROOTFS/etc/rx3-ctl" >/dev/null
-sudo cp "$HANDOFF/asound.conf" "$ROOTFS/etc/asound.conf"
+echo "hw:0" | sudo tee "$R/etc/rx3-ctl" >/dev/null
+sudo cp "$H/asound.conf" "$R/etc/asound.conf"
 
-say "Mounting chroot bind mounts"
-sudo "$HANDOFF/mount-rx3.sh"
+# --- 10. /proc/asound bind ---
+say "Bind-mounting /proc/asound"
+sudo mkdir -p "$R/proc/asound"
+mountpoint -q "$R/proc/asound" || sudo mount --bind /proc/asound "$R/proc/asound"
 
-say "Adding /proc/asound bind (firmware queries card info via /proc/asound)"
-sudo mkdir -p "$ROOTFS/proc/asound"
-mountpoint -q "$ROOTFS/proc/asound" || sudo mount --bind /proc/asound "$ROOTFS/proc/asound"
-
-# ---------------------------------------------------------------------------
-# Step 9 — host helper binaries (native aarch64)
-# ---------------------------------------------------------------------------
-say "Compiling touch bridge"
-gcc -O2 -DRX3_ROOT_PATH="\"$ROOTFS\"" \
-    -o "$HOME/rx3-touch-bridge" "$HANDOFF/touch-bridge.c"
-
-say "Compiling framebuffer presenter"
-gcc -O2 -DRX3_ROOT_PATH="\"$ROOTFS\"" \
+# --- 11. compile host helpers ---
+say "Compiling presenter + touch bridge"
+gcc -O2 -DRX3_ROOT_PATH="\"$R\"" \
     $(pkg-config --cflags freetype2) \
-    -o "$HOME/rx3-fb-present" "$HANDOFF/fb-present.c" \
-    $(pkg-config --libs freetype2)
+    -o "$HOME/rx3-fb-present" fb-present.c \
+    $(pkg-config --libs freetype2) || die "fb-present.c failed"
+gcc -O2 -DRX3_ROOT_PATH="\"$R\"" \
+    -o "$HOME/rx3-touch-bridge" touch-bridge.c || die "touch-bridge.c failed"
 
-say "Verifying host binaries are aarch64"
-for bin in "$HOME/rx3-fb-present" "$HOME/rx3-touch-bridge"; do
-    [ -x "$bin" ] || die "$bin missing or not executable"
-    if ! readelf -h "$bin" 2>/dev/null | grep -q 'AArch64'; then
-        readelf -h "$bin" | sed 's/^/      /' >&2
-        die "$bin is not aarch64 — gcc built for the wrong target"
-    fi
-done
-file "$HOME/rx3-fb-present" "$HOME/rx3-touch-bridge" || true
-
-# ---------------------------------------------------------------------------
-# Step 10 — auto-detect touch device
-# ---------------------------------------------------------------------------
-say "Auto-detecting touch device (name: $TOUCH_NAME)"
-TOUCH_DEV=""
-for e in /dev/input/event*; do
-    n=$(basename "$e")
-    name=$(cat "/sys/class/input/$n/device/name" 2>/dev/null || true)
-    [ "$name" = "$TOUCH_NAME" ] || continue
-    out=$(sudo timeout 2 "$HOME/rx3-touch-bridge" "$e" "$ROOTFS/dev/tsc2007_2-0048" 2>&1 | head -1 || true)
-    if printf '%s' "$out" | grep -q '^touch bridge: touchscreen'; then
-        TOUCH_DEV="$e"
-        echo "    selected $e  →  $out"
-        break
-    fi
-done
-[ -n "$TOUCH_DEV" ] || die "Could not find a usable touch device named '$TOUCH_NAME'."
-say "Touch device locked in as: $TOUCH_DEV"
-
-# ---------------------------------------------------------------------------
-# Step 11 — rotation config
-# ---------------------------------------------------------------------------
-say "Writing rotation config ($ROTATION)"
-echo "RX3_ROTATE=$ROTATION" > "$HANDOFF/rx3.conf"
-
-# ---------------------------------------------------------------------------
-# Step 12 — manual launcher ~/rx3-up.sh
-# ---------------------------------------------------------------------------
-say "Creating ~/rx3-up.sh (touch device: $TOUCH_DEV)"
-cat > "$HOME/rx3-up.sh" <<ENDOFSCRIPT
-#!/bin/bash
-set -u
-cd ~/Rx3-flx4/rx3-handoff
-. ./rx3-env.sh
-
-sudo pkill -f rbp-pi 2>/dev/null
-sudo pkill -f rx3-fb-present 2>/dev/null
-sudo pkill -f rx3-touch-bridge 2>/dev/null
-sleep 1
-
-for m in \$(mount | awk '/rx3-rootfs/ {print \$3}'); do
-    sudo umount "\$m" 2>/dev/null
+for b in "$HOME/rx3-fb-present" "$HOME/rx3-touch-bridge"; do
+    got=$(strings "$b" | grep -m1 'ui-state' || true)
+    case "$got" in "$R"*) echo "    $b ok";;
+        *) die "$b wrong path: $got";; esac
 done
 
-if [ ! -f ~/rx3-rootfs/etc/rx3-ctl ]; then
-    echo "rebuilding chroot..."
-    ./build-rootfs.sh >/dev/null
-    echo "hw:0" | sudo tee ~/rx3-rootfs/etc/rx3-ctl >/dev/null
-    cp asound.conf ~/rx3-rootfs/etc/asound.conf
-fi
+# --- 12. rotation ---
+say "Writing rx3.conf (RX3_ROTATE=$ROT)"
+echo "RX3_ROTATE=$ROT" > "$H/rx3.conf"
 
-sudo ./mount-rx3.sh >/dev/null
-sudo mkdir -p ~/rx3-rootfs/proc/asound
-mountpoint -q ~/rx3-rootfs/proc/asound || sudo mount --bind /proc/asound ~/rx3-rootfs/proc/asound
-sudo systemctl stop gdm 2>/dev/null
-sleep 1
+# --- 13. upstream install.sh ---
+say "Running upstream install.sh"
+./install.sh || die "install.sh failed"
+sudo systemctl daemon-reload
+sudo systemctl enable rx3.service 2>/dev/null || true
 
-# Pre-create world-writable logs so both root and this user can write.
-for f in player present touch; do
-    sudo rm -f /tmp/\$f.log
-    sudo touch /tmp/\$f.log
-    sudo chmod 666 /tmp/\$f.log
+# --- 14. touch bridge service ---
+say "Installing rx3-pointer.service"
+
+# Find the bare touchscreen by-path
+BY=""
+for p in /dev/input/by-path/*event*; do
+    [ -e "$p" ] || continue
+    tgt="/sys/class/input/$(basename $(readlink -f "$p"))/device/name"
+    n=$(cat "$tgt" 2>/dev/null || true)
+    [ "$n" = "$TOUCH_NAME" ] && { BY="$p"; break; }
 done
+if [ -n "$BY" ]; then echo "    touch by-path: $BY"; fi
 
-sudo chroot ~/rx3-rootfs /bin/busybox sh -c \\
-    'cd /root/pdj && exec env LD_PRELOAD=/lib/fbshim.so /root/pdj/rbp-pi -a' \\
-    > /tmp/player.log 2>&1 &
-sleep 5
-
-sudo RX3_FB=/dev/fb0 RX3_ROTATE="\$RX3_ROTATE" RX3_FONT=/usr/share/fonts/dejavu/DejaVuSans.ttf \\
-    ~/rx3-fb-present ~/rx3-rootfs/dev/fb0 > /tmp/present.log 2>&1 &
-
-sudo RX3_ROTATE="\$RX3_ROTATE" \\
-    ~/rx3-touch-bridge $TOUCH_DEV ~/rx3-rootfs/dev/tsc2007_2-0048 \\
-    > /tmp/touch.log 2>&1 &
-
-sleep 2
-echo "rotation:  \$RX3_ROTATE"
-echo "player:    \$(pgrep -f rbp-pi | tr '\n' ' ')"
-echo "presenter: \$(pgrep -f rx3-fb-present | tr '\n' ' ')"
-echo "touch:     \$(pgrep -f rx3-touch-bridge | tr '\n' ' ')"
-ENDOFSCRIPT
-chmod +x "$HOME/rx3-up.sh"
-
-# ---------------------------------------------------------------------------
-# Step 13 — systemd service script
-# ---------------------------------------------------------------------------
-say "Installing /usr/local/bin/rx3-service.sh"
-sudo tee /usr/local/bin/rx3-service.sh >/dev/null <<ENDOFSVC
-#!/bin/bash
-set -u
-U=/home/user
-H=\$U/Rx3-flx4/rx3-handoff
-R=\$U/rx3-rootfs
-
-# Pre-create world-writable logs so both root and the user can write them.
-for f in player present touch; do
-    : > /tmp/\$f.log
-    chmod 666 /tmp/\$f.log
-done
-
-case "\${1:-start}" in
-  start)
-    systemctl stop gdm 2>/dev/null
-    sleep 1
-    cd "\$H"
-    ./mount-rx3.sh >/dev/null
-    mkdir -p "\$R/proc/asound"
-    mountpoint -q "\$R/proc/asound" || mount --bind /proc/asound "\$R/proc/asound"
-    [ -f "\$R/etc/rx3-ctl" ] || echo "hw:0" > "\$R/etc/rx3-ctl"
-    ROT=270
-    [ -f "\$H/rx3.conf" ] && . "\$H/rx3.conf"
-
-    chroot "\$R" /bin/busybox sh -c \\
-      'cd /root/pdj && exec env LD_PRELOAD=/lib/fbshim.so /root/pdj/rbp-pi -a' \\
-      > /tmp/player.log 2>&1 &
-    sleep 5
-
-    RX3_FB=/dev/fb0 RX3_ROTATE="\$ROT" RX3_FONT=/usr/share/fonts/dejavu/DejaVuSans.ttf \\
-      "\$U/rx3-fb-present" "\$R/dev/fb0" > /tmp/present.log 2>&1 &
-
-    RX3_ROTATE="\$ROT" \\
-      "\$U/rx3-touch-bridge" $TOUCH_DEV "\$R/dev/tsc2007_2-0048" \\
-      > /tmp/touch.log 2>&1 &
-    ;;
-  stop)
-    pkill -f rbp-pi 2>/dev/null
-    pkill -f rx3-fb-present 2>/dev/null
-    pkill -f rx3-touch-bridge 2>/dev/null
-    systemctl start gdm 2>/dev/null
-    ;;
-esac
-exit 0
-ENDOFSVC
-sudo chmod +x /usr/local/bin/rx3-service.sh
-
-# ---------------------------------------------------------------------------
-# Step 14 — systemd unit
-# ---------------------------------------------------------------------------
-say "Installing /etc/systemd/system/rx3.service"
-sudo tee /etc/systemd/system/rx3.service >/dev/null <<'EOF'
+sudo tee /etc/systemd/system/rx3-pointer.service >/dev/null <<EOF
 [Unit]
-Description=XDJ-RX3 firmware emulation (Lenovo Duet 1)
-After=network-online.target
-Wants=network-online.target
+Description=RX3 touch bridge (swipe-up overlay)
+After=rx3.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-KillMode=none
-ExecStart=/usr/local/bin/rx3-service.sh start
-ExecStop=/usr/local/bin/rx3-service.sh stop
-TimeoutStartSec=180
-TimeoutStopSec=30
+Type=simple
+User=root
+Environment=RX3_FB=/dev/fb0
+Environment=RX3_ROTATE=$ROT
+ExecStart=/bin/bash -c 'for i in \$(seq 1 60); do for e in /dev/input/event*; do n=\$(cat /sys/class/input/\$(basename \$e)/device/name 2>/dev/null); if [ "\$n" = "$TOUCH_NAME" ]; then exec $HOME/rx3-touch-bridge "\$e" $R/dev/tsc2007_2-0048; fi; done; sleep 2; done; exit 1'
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable rx3.service
-
-# ---------------------------------------------------------------------------
-# Step 15 — USB hotplug udev rule
-# ---------------------------------------------------------------------------
-say "Installing /etc/udev/rules.d/99-rx3-usb.rules"
+# --- 15. udev rules ---
 sudo mkdir -p /etc/udev/rules.d
-sudo tee /etc/udev/rules.d/99-rx3-usb.rules >/dev/null <<EOF
-# Hot-plugged USB storage partitions are presented to the RX3 player as USB1/USB2.
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_TYPE}!="", RUN+="/bin/sh -c '/usr/bin/systemd-run --no-block $HANDOFF/usb-hotplug.sh add %E{DEVNAME}'"
-ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", RUN+="/bin/sh -c '/usr/bin/systemd-run --no-block $HANDOFF/usb-hotplug.sh remove %E{DEVNAME}'"
-EOF
-sudo udevadm control --reload-rules 2>/dev/null || true
-# --action=add is required; without it, udevadm trigger fires "change" and the
-# rule (ACTION=="add") never matches.
-sudo udevadm trigger --action=add --subsystem-match=block 2>/dev/null || true
-
-# ---------------------------------------------------------------------------
-# Step 16 — stable udev symlink for touch (best effort)
-# ---------------------------------------------------------------------------
-say "Attempting to create stable udev symlink /dev/input/rx3-touch"
-sudo mkdir -p /etc/udev/rules.d
-sudo tee /etc/udev/rules.d/99-rx3-touch.rules >/dev/null <<EOF
-ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="$TOUCH_NAME", SYMLINK+="input/rx3-touch"
+sudo tee /etc/udev/rules.d/99-rx3-touch.rules >/dev/null <<'EOF'
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHSCREEN}=="1", SYMLINK+="input/rx3-touch"
 EOF
 sudo udevadm control --reload-rules 2>/dev/null || true
 sudo udevadm trigger --action=add --subsystem-match=input 2>/dev/null || true
-sleep 1
-if [ -L /dev/input/rx3-touch ]; then
-    echo "    /dev/input/rx3-touch → $(readlink /dev/input/rx3-touch)"
-else
-    warn "udev symlink not created — scripts use $TOUCH_DEV directly."
-fi
 
-# ---------------------------------------------------------------------------
-# Step 17 — console boot by default (GDM must not grab DRM master)
-# ---------------------------------------------------------------------------
-say "Setting default target to multi-user (console, no GDM)"
-sudo systemctl set-default multi-user.target
+sudo systemctl daemon-reload
+sudo systemctl enable rx3-pointer.service
 
-# ---------------------------------------------------------------------------
-# Done
-# ---------------------------------------------------------------------------
+# --- 16. backup ---
+say "Saving working config to ~/rx3-final/"
+mkdir -p "$HOME/rx3-final"
+cp "$H/pi-controls.h" "$H/fb-present.c" "$H/touch-bridge.c" \
+   "$H/control-shim.c" "$H/rx3-control.py" "$H/usb-attach.sh" \
+   "$H/usb-hotplug.sh" "$H/rx3.conf" "$HOME/rx3-final/" 2>/dev/null || true
+cp "$HOME/rx3-fb-present" "$HOME/rx3-touch-bridge" "$HOME/rx3-final/"
+cp /usr/local/bin/rx3-service.sh "$HOME/rx3-final/" 2>/dev/null || true
+cp /etc/systemd/system/rx3.service /etc/systemd/system/rx3-pointer.service \
+   "$HOME/rx3-final/" 2>/dev/null || true
+
+# --- 17. done ---
 cat <<EOF
 
 ============================================================
-  INSTALL COMPLETE
+  INSTALL COMPLETE  (Lenovo Duet 1)
 ============================================================
 
-Repo:        $WORKDIR
-Chroot:      $ROOTFS  ($(du -sh "$ROOTFS" 2>/dev/null | cut -f1))
-Rotation:    $ROTATION
-Touch dev:   $TOUCH_DEV
-Service:     rx3.service (enabled)
-Default:     multi-user.target (console)
-USB hotplug: /etc/udev/rules.d/99-rx3-usb.rules
+  Repo:      $W
+  Chroot:    $R  ($(du -sh "$R" 2>/dev/null | cut -f1))
+  Presenter: $HOME/rx3-fb-present     (-hidable, rotation $ROT)
+  Touch:     $HOME/rx3-touch-bridge   (swipe-up overlay, rotation $ROT)
+  Backup:    $HOME/rx3-final/
+  Services:  rx3.service, rx3-pointer.service (both enabled)
 
 Next steps
 ----------
-1. Manual launch (recommended first time):
-       ~/rx3-up.sh
+1. Start:
+       sudo systemctl start rx3
+       sleep 15
+       sudo systemctl start rx3-pointer
 
-2. Or reboot. After ~15 s the RX3 UI should appear on the panel.
+2. Check:
+       systemctl status rx3 rx3-pointer --no-pager | grep -E '●|Active:'
+       pgrep -af 'rbp-pi|rx3-fb-present|rx3-touch-bridge'
 
-3. Service control:
-       systemctl status rx3 --no-pager
-       sudo systemctl restart rx3
-       sudo systemctl stop rx3        # returns you to a normal console
+3. Overlay is visible on boot; hides 8 s after last touch.
+   Swipe up on the screen to bring it back.
 
-4. Logs:
-       tail -40 /tmp/player.log
-       tail -40 /tmp/present.log
-       tail -40 /tmp/touch.log
+4. Keyboard control (works whether overlay is visible or not):
+       cd $H
+       python3 rx3-control.py source
+       python3 rx3-control.py usb1
+       python3 rx3-control.py rotary +1
+       python3 rx3-control.py enter
+       python3 rx3-control.py load 0
+       python3 rx3-control.py play 0
+       python3 rx3-control.py query
 
-5. USB: plug a FAT32 stick in. Watch:
+5. USB: plug in a FAT32 stick, then:
        sudo journalctl -t rx3 -f
-   Then tap SOURCE → USB1 on the panel.
+       python3 rx3-control.py mount usb1 /media/usb1/sdX1
+       python3 rx3-control.py source
+       python3 rx3-control.py usb1
 
-Known limitations (see README-DUET1.md)
----------------------------------------
-- Audio does not play. The firmware's engine stalls before writing to the
-  ALSA PCM even when the shim lies about the card name.
-- Taps on the panel are read by the touch bridge and mapped to regions, but
-  the firmware never opens /dev/tsc2007_2-0048, so it does not act on them.
-- Both are internal to rbp-pi and require binary reverse engineering.
+Known limits:
+  - Audio does not work (firmware expects cs4344audiorev8 card;
+    only a physical DDJ-FLX4 provides it)
+  - op=0 for buttons on the Duet; op=1 corrupts the mixer
+  - Overlay swipe detection requires a real drag, not a tap
 
-Full log of this install: $HOME/rx3-install.log
+Full log: $HOME/rx3-install.log
 EOF
+INSTALL_EOF
+chmod +x ~/rx3-duet1-install.sh
