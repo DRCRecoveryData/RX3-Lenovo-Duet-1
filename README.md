@@ -1,979 +1,319 @@
 # XDJ-RX3 Firmware Emulation on Lenovo Duet 1
 
-Running the Pioneer XDJ-RX3 v1.19 ARM32 firmware on a Lenovo Duet 1
-(MediaTek MT8183 / `google-krane`) under postmarketOS. Autostarts as a
-systemd service, renders to the built-in 1200×1920 DSI panel rotated 270°,
-accepts touch input, and mounts hot-plugged USB sticks as rekordbox media.
-
-This is a port of the Pi 5 project at https://github.com/mutlisensor/Rx3-flx4
-to Alpine/musl + MediaTek hardware. It does not use the Raspberry Pi code
-paths unchanged — see "Alpine-specific changes" below.
-
----
+Running the Pioneer XDJ-RX3 v1.19 ARM32 firmware **natively** on a Lenovo
+Duet 1 (MediaTek MT8183, `google-krane`, postmarketOS / Alpine + systemd).
+The aarch64 kernel's `CONFIG_COMPAT` executes 32-bit ARM directly —
+**no QEMU, no emulation**.
 
 ## Tested on
 
-| Component        | Value                                                |
-|------------------|------------------------------------------------------|
-| Device           | Lenovo Duet 1 (`google-krane`, MediaTek MT8183)      |
-| OS               | postmarketOS (Alpine-based, **systemd**)             |
-| Kernel           | 6.18.28-mt81 (aarch64 with CONFIG_COMPAT)            |
-| Display          | 1200×1920 DSI panel, `mediatekdrmfb`, 32bpp, stride 4800 |
-| Touchscreen      | `hid-over-i2c 27C6:0E30` (bare interface, no suffix) |
-| USB              | xHCI via MTU3, host mode on USB-C                    |
-| Audio card       | `mt8183_mt6358_ts3a227_max98357`, 48 kHz stereo only |
-| User             | `user` (uid 10000), home `/home/user`                |
-| Rotation         | 270° clockwise                                       |
+| Component   | Value                                         |
+|-------------|-----------------------------------------------|
+| Device      | Lenovo Duet 1 (`google-krane`, MT8183)        |
+| OS          | postmarketOS (Alpine, systemd)                |
+| Kernel      | 6.18.28-mt81 (aarch64, CONFIG_COMPAT=y)       |
+| Display     | 1200×1920 DSI, `mediatekdrmfb`                |
+| Rotation    | 270° clockwise                                |
+| Touchscreen | `hid-over-i2c 27C6:0E30` (bare interface)     |
+| User        | `user` (uid 10000), home `/home/user`         |
 
-The kernel must have `CONFIG_COMPAT` (32-bit ARM execution). The installer
-tests this empirically with a freestanding armv7 binary.
+## Quick install
+
+```bash
+bash ~/rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log
+```
+
+The installer pauses at firmware recovery. Have ready:
+1. **XDJ-RX3 v1.19 update** (.zip) from AlphaTheta support downloads
+2. **Pioneer GPL source distribution** (.zip) from Pioneer's open-source page
+
+After install:
+
+```bash
+sudo systemctl start rx3
+sleep 15
+sudo systemctl start rx3-pointer
+systemctl status rx3 rx3-pointer --no-pager | grep -E '●|Active:'
+```
+
+On the Duet the firmware boots in ~15 s (native ARM32, no emulation).
+
+## Features
+
+| Feature | Status |
+|---------|--------|
+| RX3 UI on panel, rotation 270 | ✅ |
+| Touch input (overlay buttons) | ✅ |
+| Swipe-up to reveal overlay | ✅ |
+| Auto-hide overlay after 8 s | ✅ |
+| Keyboard control | ✅ |
+| USB hotplug | ✅ |
+| Autostart on boot | ✅ |
+| Audio | ❌ firmware gate — see below |
+
+### Overlay behavior
+
+- **Visible on boot** — the 12 buttons and 6 sliders
+- **Auto-hides 8 s** after your last touch
+- **Swipe up** on the screen to bring it back
+- While visible, buttons fire on tap; the timer resets on every touch
+- While hidden, the firmware UI runs fullscreen
+
+The overlay and the firmware share a byte at offset 48 of
+`~/rx3-rootfs/dev/rx3-ui-state`. The presenter reads it to decide
+whether to draw chrome; the touch bridge writes it.
+
+## Daily use
+
+| Task | Command |
+|------|---------|
+| Status | `systemctl status rx3 rx3-pointer --no-pager` |
+| Restart | `sudo systemctl restart rx3 && sleep 15 && sudo systemctl restart rx3-pointer` |
+| Stop | `sudo systemctl stop rx3-pointer rx3` |
+| Player log | `tail -40 /tmp/player.log` |
+| Touch log | `tail -20 ~/rx3-touch.log` |
+| Firmware state | `python3 ~/Rx3-flx4/rx3-handoff/rx3-control.py query` |
+
+### Keyboard control
+
+```bash
+cd ~/Rx3-flx4/rx3-handoff
+C="python3 rx3-control.py"
+
+$C source;    sleep 1     # open SOURCE menu
+$C usb1;      sleep 1     # select USB1
+$C rotary +1; sleep 0.5   # scroll
+$C enter;     sleep 1     # enter folder
+$C load 0;    sleep 1     # load to deck 1
+$C play 0;    sleep 1     # play
+$C query                  # dump engine state
+```
+
+**Put ~0.5–1 second between commands.** The firmware drops rapid input.
+
+### USB
+
+```bash
+ls /dev/sd*                  # find partition (sda1, sdb1, ...)
+# plug in a FAT32/exFAT stick
+sudo journalctl -t rx3 -f    # watch for "usb1 attached"
+python3 ~/Rx3-flx4/rx3-handoff/rx3-control.py mount usb1 /media/usb1/sdX1
+```
+
+On the UI: **SOURCE → USB1**.
+
+## The seven patches that make it work
+
+All baked into the installer. Listed here so you understand what's
+non-standard if you ever need to debug or re-apply.
+
+### 1. `patch-player.py` — `getPcController` NULL fix
+
+The upstream repo doesn't include this. Without it, the firmware segfaults
+at startup with `si_addr=0x9c` (NULL deref at offset 0x9c):
+
+```python
+words(0x31df70, 0xe3a00000)   # mov r0, #0
+```
+
+### 2. `control-shim.c` — input gate re-unlock
+
+`notify1stKeyHandled(manager, 3)` releases the firmware's startup input
+gate. On the Duet, the UI re-locks it after init. The shim now has a
+background `gate_thread` that re-calls it every 10 seconds, and calls it
+again before every `sendkey`.
+
+### 3. `rx3-control.py` — `op=0` for button press (Duet-specific)
+
+**This is the opposite of other machines.** On the Duet the firmware needs:
+
+```python
+send(k,0,ch); time.sleep(.1); send(k,2,ch)
+```
+
+Using `op=1` (which is correct on the Chuwi MiniBook and other x86_64 hosts)
+**resets the entire mixer state to 0.000** and corrupts the input handler.
+
+### 4. `fb-present.c` — `-hidable` flag
+
+Adds a `-hidable` flag: chrome (buttons + sliders) is drawn only when
+`state->overlay_visible` is set. The `idx[]` panel-to-canvas map is
+recomputed when the mode changes: letterboxed when chrome is drawn,
+fullscreen stretch when it's hidden.
+
+### 5. `touch-bridge.c` — swipe up + auto-hide
+
+- Records `y_min`/`y_max`/`t_start` on finger-down
+- On release: if `y_max - y_min > 250` and elapsed `< 700 ms` → sets
+  `overlay_visible = 1` (span is direction-agnostic, so up works)
+- Clears `overlay_visible` when `now - last_touch > 8000 ms`
+- Any finger-down while overlay is visible resets the timer
+
+### 6. `usb-attach.sh` — mknod hex→decimal
+
+Alpine's BusyBox `mknod` and Debian's coreutils both reject the `0x`
+prefix. The fix converts:
+
+```bash
+mknod $R/dev/$PART b $((16#$(stat -c %t "$SRC"))) $((16#$(stat -c %T "$SRC")))
+```
+
+### 7. `usb-hotplug.sh` — retry loop
+
+The upstream one-shot `rx3-control.py mount` call often misses because the
+FIFO isn't ready when udev fires. Now retries 15 times, 1 s apart, and logs
+`(mount event sent=1)` on success.
+
+## Audio limitation
+
+The firmware's audio engine opens an ALSA card named `cs4344audiorev8`
+(the Cirrus CS4344 DAC the real XDJ-RX3 uses). No such card exists on a
+laptop or tablet. The play state toggles correctly (`player0 playing=1`)
+but no audio samples reach any hardware.
+
+The **only** fix is a physical **Pioneer DDJ-FLX4** connected via USB —
+the project's `fbshim.c` redirects the firmware's ALSA calls to the
+controller's USB sound card. Without it, no sound.
+
+Fixing this without the controller would require Ghidra + ARM32
+reverse-engineering of `rbp-pi`.
+
+## Troubleshooting
+
+### Player segfaults at startup (`si_addr=0x9c`)
+
+The `getPcController` patch is missing. Verify:
+
+```bash
+arm-linux-gnueabi-objdump -d ~/rx3-rootfs/root/pdj/rbp-pi \
+    --start-address=0x31df6c --stop-address=0x31df78
+```
+
+Expect `31df70: e3a00000  mov r0, #0`.
+
+### `build-rootfs.sh` fails with `Permission denied` / `Resource busy`
+
+Stale bind mounts. Reboot or unmount manually:
+
+```bash
+sudo systemctl stop rx3 rx3-pointer
+sudo pkill -9 -f rbp-pi
+for m in $(mount | awk '/rx3-rootfs/ {print $3}' | sort -r); do
+    sudo umount -l "$m" 2>/dev/null || true
+done
+mount | grep rx3-rootfs   # should be empty
+./build-rootfs.sh
+```
+
+### `source` opens but nothing else works
+
+The firmware's input gate re-locked. Restart the player:
+
+```bash
+sudo systemctl restart rx3
+sleep 15
+```
+
+### `op=1` corruption
+
+If the mixer query shows `fader=0.000` after a button press, you're using
+`op=1`. Fix:
+
+```bash
+cd ~/Rx3-flx4/rx3-handoff
+sed -i '40s|send(k,1,ch)|send(k,0,ch)|' rx3-control.py
+```
+
+### Overlay doesn't auto-hide
+
+Check that the touch bridge is running and idle:
+
+```bash
+pgrep -af rx3-touch-bridge
+xxd -s 48 -l 4 ~/rx3-rootfs/dev/rx3-ui-state
+```
+
+`0000 0000` = hidden. `0100 0000` = visible. If it stays `0100 0000` with
+no touches, a finger's down flag is stuck — restart the bridge:
+
+```bash
+sudo systemctl restart rx3-pointer
+```
+
+### Swipe doesn't reveal overlay
+
+The gesture must be a **drag**: finger down, slide across the screen,
+then lift. A tap won't trigger it. If drags don't work, check the log:
+
+```bash
+tail -20 ~/rx3-touch.log
+```
+
+Look for `touch begin` lines. If they appear but the overlay stays hidden,
+the touch threshold (250 canvas pixels) is too high — lower it in
+`touch-bridge.c` and rebuild.
+
+## Backup
+
+After a working install:
+
+```bash
+ls -la ~/rx3-final/
+```
+
+Contains: source files, compiled binaries, service unit, and `rx3.conf`.
+Copy `~/rx3-final/` and `~/rx3-duet1-install.sh` to a USB stick or cloud.
+
+## Machine comparison
+
+| Machine | Arch | Firmware runs via | Buttons op | Notes |
+|---------|------|-------------------|-----------|-------|
+| **Duet 1** | ARM64 | native CONFIG_COMPAT | **0** | fast; op=1 corrupts mixer |
+| Chuwi MiniBook | x86_64 | QEMU ARM32 | 1 | slow; op=0 silently ignored |
+| Lenovo laptops | x86_64 | QEMU ARM32 | 1 | same as Chuwi |
+| Pi 4 + 5" DSI | ARM64 | native CONFIG_COMPAT | 0 | 800×480 panel, UI text small |
+| Pi 5 + 7" | ARM64 | native CONFIG_COMPAT | 0 | project's target hardware |
+```
 
 ---
 
-## Quick install
+## Install
 
 ```bash
 chmod +x ~/rx3-duet1-install.sh
 ~/rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log
 ```
 
-Idempotent — re-running skips completed steps. If `recover-firmware.py`
-hangs (it's interactive, sometimes the prompt is hidden behind `tee`),
-Ctrl+C and run it manually from `~/Rx3-flx4/rx3-handoff`, then re-run.
+Have the firmware `.zip` files ready — it pauses at step 7.
 
----
+The installer:
+1. Installs Alpine packages
+2. Symlinks `armv7-*` toolchain → `arm-linux-gnueabi-*`
+3. Symlinks kernel uapi headers into the armv7 sysroot
+4. Tests 32-bit ARM execution
+5. Clones the repo
+6. **Patches all eight source files in one Python block** (patch-player.py, build-rootfs.sh, control-shim.c, pi-controls.h, fb-present.c, touch-bridge.c, rx3-control.py, usb-attach.sh, usb-hotplug.sh)
+7. Recovers firmware (interactive)
+8. Builds the chroot
+9. Binds `/proc/asound`
+10. Compiles `rx3-fb-present` and `rx3-touch-bridge`
+11. Runs upstream `install.sh` for the systemd unit and udev rules
+12. Installs `rx3-pointer.service` with auto-detect
+13. Saves everything to `~/rx3-final/`
 
-## What works
+Every patch has an idempotent check — re-running is safe. If a pattern doesn't match (because the upstream file changed), the patcher reports `MISS: filename:tag` and continues, so you can see exactly what failed.
 
-| Feature         | Status                                                |
-|-----------------|-------------------------------------------------------|
-| RX3 UI on panel | ✅ rotation 270, 1200×1920 native                     |
-| Touch           | ✅ taps land on on-screen buttons                     |
-| USB media       | ✅ FAT32 sticks mounted via fuse-overlayfs, firmware reads SOURCE → USB1 |
-| Autostart       | ✅ systemd `oneshot` with `KillMode=none`             |
-| Audio           | ❌ firmware engine stalls before writing to the PCM   |
-
----
-
-## Prerequisites
-
-The installer pulls these via `apk add`. Listed here for reference.
-
-```bash
-sudo apk add \
-    git bash \
-    build-base gcc g++ make patch linux-headers binutils \
-    gcc-armv7 binutils-armv7 musl-armv7 musl-dev-armv7 libstdc++-dev-armv7 \
-    fuse-overlayfs exfatprogs alsa-utils \
-    py3-pillow py3-cryptography \
-    rsync 7zip \
-    freetype-dev pkgconf font-dejavu libpng-dev \
-    strace lsof coreutils
-```
-
-The armv7 toolchain is installed as
-`armv7-alpine-linux-musleabihf-gcc` and symlinked to
-`arm-linux-gnueabi-gcc` in `/usr/local/bin`, because the upstream
-`build-rootfs.sh` hardcodes the Debian cross-compiler name. Kernel uapi
-headers (`asm`, `asm-generic`, `linux`) are symlinked from `/usr/include`
-into the armv7 sysroot.
-
----
-
-## Installation (manual, step by step)
-
-### 1. Clone and patch the repo
+## After install
 
 ```bash
-cd ~
-git clone https://github.com/mutlisensor/Rx3-flx4.git
-cd Rx3-flx4/rx3-handoff
-chmod +x *.sh
+sudo systemctl start rx3
+sleep 15
+sudo systemctl start rx3-pointer
+
+systemctl status rx3 rx3-pointer --no-pager | grep -E '●|Active:'
+pgrep -af 'rbp-pi|rx3-fb-present|rx3-touch-bridge'
 ```
 
-**Patch `build-rootfs.sh`** for the Alpine sysroot path:
+Three processes; UI on the panel; overlay visible; swipe up works.
 
-```bash
-sed -i 's|arm-linux-gnueabi-gcc -shared -fPIC|arm-linux-gnueabi-gcc --sysroot=/usr/armv7-alpine-linux-musleabihf -shared -fPIC|' build-rootfs.sh
-sed -i 's|apt install gcc-arm-linux-gnueabi|apk add gcc-armv7 musl-dev-armv7|' build-rootfs.sh
-```
-
-**Patch `patch-player.py`** to fix a NULL-pointer crash in
-`getPcController`. On the Duet, the global `IUiObjManager` singleton at
-`0x026867c0` is NULL when a JuceTimer fires, so the firmware dereferences
-NULL at offset 0x9c:
-
-```bash
-sed -i "s|(b/'rbp-pi').write_bytes(p)|# getPcController: return NULL instead of deref'ing a NULL singleton (JuceTimer fires before init).\nwords(0x31df70,0xe3a00000)\n(b/'rbp-pi').write_bytes(p)|" patch-player.py
-grep -n '31df70' patch-player.py
-```
-
-**Patch `usb-hotplug.sh`** — the upstream uses `pgrep -x rbp-pi`, which
-never matches the chroot-wrapped player. `pgrep -x` compares against the
-`comm` field (truncated to 15 chars, derived from the binary path).
-`pgrep -f` matches the full command line:
-
-```bash
-sed -i 's|pgrep -x rbp-pi|pgrep -f rbp-pi|' usb-hotplug.sh
-grep -n 'pgrep' usb-hotplug.sh
-```
-
-**Rewrite `asound.conf`** for the Duet's stereo internal card. Note `hw:0,0`
-not `plughw:0,0` — dmix rejects `plughw` as a slave with
-`snd_pcm_dmix_open) dmix plugin can be only connected to hw plugin`.
-And the rate is 48000 because the MT8183 card reports `RATE: 48000`
-(singular, not a range):
-
-```bash
-cp asound.conf asound.conf.orig
-cat > asound.conf <<'EOF'
-pcm.rx3mix {
- type dmix
- ipc_key 5396531
- ipc_key_add_uid true
- slave {
-  pcm "hw:0,0"
-  format S16_LE
-  rate 48000
-  channels 2
- }
- bindings { 0 0 1 1 }
-}
-pcm.rx3out { type plug  slave.pcm "rx3mix" }
-pcm.rx3cue { type plug  slave.pcm "rx3mix" }
-EOF
-```
-
-### 2. Recover the firmware
-
-You need a legitimate copy of the XDJ-RX3 v1.19 firmware. The scripts
-download it from AlphaTheta and decrypt it using the AES key from Pioneer's
-GPL source distribution.
-
-```bash
-python3 recover-firmware.py
-python3 extract_cramfs.py
-```
-
-Must finish with `Extraction complete.` If it doesn't, `runtime-symlinks.json`
-won't exist and the next step will fail.
-
-### 3. Build the chroot
-
-```bash
-./build-rootfs.sh 2>&1 | tee /tmp/build-rootfs.log
-```
-
-Expect `== done` and a size around 109 MB.
-
-### 4. Set up chroot runtime files
-
-```bash
-echo "hw:0" | sudo tee ~/rx3-rootfs/etc/rx3-ctl
-cp asound.conf ~/rx3-rootfs/etc/asound.conf
-sudo ./mount-rx3.sh
-sudo mkdir -p ~/rx3-rootfs/proc/asound
-sudo mount --bind /proc/asound ~/rx3-rootfs/proc/asound
-```
-
-The `/proc/asound` bind is required: the firmware enumerates card info
-through `/proc/asound/cards`, which doesn't exist inside the chroot
-otherwise. `mount-rx3.sh` doesn't set it up — it only mounts `/dev` and
-`/tmp`.
-
-### 5. Compile the host helper binaries
-
-These run natively (aarch64) on the Duet.
-
-```bash
-cd ~/Rx3-flx4/rx3-handoff
-
-gcc -O2 -DRX3_ROOT_PATH='"/home/user/rx3-rootfs"' \
-    -o ~/rx3-touch-bridge touch-bridge.c
-
-gcc -O2 -DRX3_ROOT_PATH='"/home/user/rx3-rootfs"' \
-    $(pkg-config --cflags freetype2) \
-    -o ~/rx3-fb-present fb-present.c \
-    $(pkg-config --libs freetype2)
-```
-
-Verify with `readelf`, NOT `file | grep aarch64` — the busybox `file`
-applet's output is not reliable for this check:
-
-```bash
-for b in ~/rx3-fb-present ~/rx3-touch-bridge; do
-    readelf -h "$b" | grep -E 'Class|Machine'
-done
-# Expect: Class: ELF64 / Machine: AArch64
-```
-
-### 6. Find the touch device
-
-The touchscreen is `hid-over-i2c 27C6:0E30` but the kernel creates **four**
-event interfaces with that base name:
-
-```
-event3   hid-over-i2c 27C6:0E30                ← bare, has ABS_MT ranges
-event4   hid-over-i2c 27C6:0E30 Stylus         ← zeroed ranges
-event5   hid-over-i2c 27C6:0E30 Stylus         ← no ABS_MT axes at all
-event6   hid-over-i2c 27C6:0E30 UNKNOWN        ← zeroed ranges
-```
-
-The bridge needs the bare one — the only one with real
-`ABS_MT_POSITION_X/Y` values. Auto-detect:
-
-```bash
-for e in /dev/input/event*; do
-    n=$(basename "$e")
-    name=$(cat /sys/class/input/$n/device/name 2>/dev/null)
-    [ "$name" = "hid-over-i2c 27C6:0E30" ] || continue
-    printf '=== %s (%s) ===\n' "$e" "$name"
-    sudo timeout 2 ~/rx3-touch-bridge "$e" ~/rx3-rootfs/dev/tsc2007_2-0048 2>&1 | head -1
-done
-```
-
-The correct device prints:
-
-```
-touch bridge: touchscreen, panel 1200x1920 rotate 90, canvas 1200x1920 at 0,0, touch 0..7200 x 0..11520
-```
-
-(the `rotate 90` is because `RX3_ROTATE` wasn't set; the service passes 270)
-
-The wrong ones print `touch ranges: Invalid argument`.
-
-**`eventN` numbers shuffle across reboots.** The udev symlink (step 10
-below) fixes this permanently.
-
-### 7. Set rotation
-
-```bash
-echo 'RX3_ROTATE=270' > ~/Rx3-flx4/rx3-handoff/rx3.conf
-```
-
-### 8. Autostart on boot (systemd)
-
-A `oneshot` service with `KillMode=none` launches the three processes
-without killing them when the script exits. See
-`/usr/local/bin/rx3-service.sh` and `/etc/systemd/system/rx3.service` in
-the installer.
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable rx3.service
-sudo systemctl set-default multi-user.target
-```
-
-**`systemctl set-default multi-user.target` is required.** Otherwise GDM
-grabs the DRM master first and the presenter can't draw.
-
-### 9. USB hotplug
-
-Two udev rules forward the partition add/remove events to `usb-hotplug.sh`,
-which calls `usb-attach.sh` to set up a fuse-overlayfs mount inside the
-chroot:
-
-```bash
-sudo mkdir -p /etc/udev/rules.d
-sudo tee /etc/udev/rules.d/99-rx3-usb.rules >/dev/null <<'EOF'
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_TYPE}!="", RUN+="/bin/sh -c '/usr/bin/systemd-run --no-block /home/user/Rx3-flx4/rx3-handoff/usb-hotplug.sh add %E{DEVNAME}'"
-ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", RUN+="/bin/sh -c '/usr/bin/systemd-run --no-block /home/user/Rx3-flx4/rx3-handoff/usb-hotplug.sh remove %E{DEVNAME}'"
-EOF
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger --action=add --subsystem-match=block
-```
-
-**`--action=add` is required.** Without it, `udevadm trigger` fires
-**`change`** actions and the rule (`ACTION=="add"`) never matches.
-
-Verify:
-
-```bash
-sudo journalctl -t rx3 -f    # in one terminal, then plug the stick in
-```
-
-Should show `rx3: usb1 attached /dev/sdb1`. Then on the panel: SOURCE → USB1.
-
-### 10. Stable touch symlink
-
-Stop `eventN` from shuffling. The rule uses `ATTRS{name}` (the kernel
-device name) and matches only the bare interface:
-
-```bash
-sudo mkdir -p /etc/udev/rules.d
-sudo tee /etc/udev/rules.d/99-rx3-touch.rules >/dev/null <<'EOF'
-ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="hid-over-i2c 27C6:0E30", SYMLINK+="input/rx3-touch"
-EOF
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger --action=add --subsystem-match=input
-sleep 1
-ls -la /dev/input/rx3-touch
-```
-
-If `/dev/input/rx3-touch → event3` appears, swap both scripts to use the
-symlink. **Note the `--action=add` again** — same reason as the USB rule.
-
----
-
-## Daily use
-
-| Task                            | Command                                   |
-|---------------------------------|-------------------------------------------|
-| Is it running?                  | `systemctl status rx3 --no-pager`         |
-| Restart                         | `sudo systemctl restart rx3`              |
-| Stop and get the desktop back   | `sudo systemctl stop rx3`                 |
-| Disable autostart               | `sudo systemctl disable rx3`              |
-| Manual start (no systemd)       | `~/rx3-up.sh`  — **run as user, NOT sudo** |
-| Player log                      | `tail -40 /tmp/player.log`                |
-| Presenter log                   | `tail -40 /tmp/present.log`               |
-| Touch log                       | `tail -40 /tmp/touch.log`                 |
-| USB attach/detach log           | `sudo journalctl -t rx3 -f`               |
-
----
-
-## Critical rules
-
-**Never run `build-rootfs.sh` while `mount-rx3.sh` mounts are active.**
-`build-rootfs.sh` uses `rsync --delete` and will fail partway through,
-destroying the chroot's `/dev/fb0` and never writing `/etc/rx3-ctl`. The
-installer guards against this by unmounting stale mounts before building.
-
-**Bind mounts don't survive reboot.** `rx3-service.sh` and `rx3-up.sh`
-both re-run `mount-rx3.sh` and re-bind `/proc/asound` at start.
-
-**postmarketOS's `sudo` does not support `-E`.** It prints
-`sudo: preserving the entire environment is not supported, '-E' is ignored`
-but the command still runs. Use the inline form `sudo VAR=val cmd`.
-
-**`~/rx3-up.sh` must not be run with `sudo`.** Under sudo, `~` expands to
-`/root`, so all paths break. The script calls `sudo` internally where
-needed. Always invoke it as your user.
-
-**`eventN` touch numbers shuffle across reboots.** The udev symlink in
-step 10 fixes this permanently.
-
-**USB sticks must be FAT32 or exFAT.** The kernel has vfat and exfat
-built in. NTFS is untested.
-
-**`pgrep -x rbp-pi` doesn't match the chroot-wrapped player.** The process
-`comm` field is truncated and derived from the binary path. `usb-hotplug.sh`
-uses `pgrep -f rbp-pi` instead, which matches the full command line.
-
-**`udevadm trigger` needs `--action=add`** to fire rules that match
-`ACTION=="add"`. Without it, it fires `change` and nothing happens.
-
-**Log files are created by root, which is why a user-run `rx3-up.sh` may
-fail with `Permission denied` on `/tmp/player.log`.** The installer and
-service pre-create them as `chmod 666`. If you create a custom launcher,
-do the same.
-
----
-
-## What we know about the audio failure
-
-The firmware's audio engine does not write to the ALSA PCM. Everything
-else — UI, touch, USB — works.
-
-Facts established:
-
-- The firmware binary contains the strings `cs4344audio` and
-  `cs4344audiorev8`. It expects an ALSA card by that name — the Cirrus
-  CS4344 codec the real RX3 uses on its I2S bus.
-- `libfbshim.so` intercepts `snd_pcm_open` and redirects device names
-  ending in `0`/`1` to `rx3out`/`rx3cue`. It also intercepts `snd_ctl_open`
-  and forces `hw:0` (the value in `/etc/rx3-ctl`).
-- Adding a `snd_ctl_card_info` override to the shim that reports the card
-  name as `cs4344audiorev8` **does** start the engine — the log shows
-  `DjEngineIF::audioDeviceAboutToStart() bufferSize: 64 sampleRate: 44100`.
-- But the engine never writes. `strace` shows a permanent loop of
-  `SNDRV_PCM_IOCTL_SYNC_PTR` with zero `WRITEI_FRAMES`. `appl_ptr` stays
-  at 0 forever.
-- The firmware asks for 44100 internally; the Duet card is 48000 only.
-  `plug`/`rate` layers on top of dmix don't change the outcome.
-
-The stall is internal to `rbp-pi`. Fixing it would require reverse-
-engineering `playengine::UsbAudio` and its callers with Ghidra or
-radare2 on ARM32 — not a configuration fix.
-
-### DirectFB renderer race (intermittent)
-
-Some startups crash in `DS_HW_Core_Surface_DrawImage` at
-`rbp-pi + 0x19d6c4` (`systemd-coredump` shows it in thread `gui_task`).
-It's intermittent — the same binary runs for hours on other boots.
-`sudo systemctl restart rx3` usually clears it.
-
----
-
-## Alpine-specific changes vs the original project
-
-| Original (Pi 5)                     | Duet 1 (Alpine)                                  |
-|-------------------------------------|--------------------------------------------------|
-| `apt` packages                       | `apk` packages (different names)                 |
-| `arm-linux-gnueabi-gcc` from Debian  | `armv7-alpine-linux-musleabihf-gcc` + symlink    |
-| Cross headers in compiler sysroot    | kernel uapi headers symlinked manually           |
-| `hw:2,0` (FLX4 USB audio)            | `hw:0,0` (MediaTek internal), 48 kHz stereo      |
-| `RX3_ROTATE` default 90              | 270                                              |
-| `systemd` unit as shipped            | needs `KillMode=none`                            |
-| `--userspec` in `chroot` (GNU)       | Alpine `chroot` is BusyBox; runs as root         |
-| Controller input (DDJ-FLX4 MIDI)     | none — touch only                                |
-| USB power-cycle via GPIO             | N/A on MT8183, removed                           |
-| `file \| grep aarch64` for verify    | `readelf -h \| grep AArch64`                     |
-| Touch device named once              | four `hid-over-i2c` interfaces; pick the bare one |
-| `pgrep -x rbp-pi` in hotplug         | `pgrep -f rbp-pi` (chroot-wrapped process)       |
-| `udevadm trigger` without action     | needs `--action=add` to match `ACTION=="add"`    |
-| No `/proc/asound` inside chroot      | bind `/proc/asound` manually                     |
-| asound.conf uses `hw:2,0`            | `hw:0,0` with rate 48000; **not** `plughw` (dmix rejects it) |
-
----
-
-## Known limitations
-
-- **No audio.** The firmware's audio engine starts (with a shim that fakes
-  the card name as `cs4344audiorev8`) but never writes to the PCM. This is
-  internal to `rbp-pi` and requires ARM32 reverse engineering to fix.
-- **Intermittent DirectFB crash** in `DS_HW_Core_Surface_DrawImage` at
-  `rbp-pi+0x19d6c4`. Non-deterministic; restart usually clears it.
-- **High CPU.** The player spins in `poll()` at ~20% of one core. Wrap
-  with `cpulimit -l 50 -- chroot ...` if running long-term.
-- **NTFS USB untested.** Use FAT32 or exFAT.
-- **Touch region mapping is partial.** Only regions the bridge knows about
-  (from its layout table) generate button presses. Taps outside those
-  regions show `region=-1` and are ignored.
-
----
-
-## Verification checklist
-
-After install, all of these should be true:
-
-- [ ] `/tmp/t32` prints `exit code: 42`
-- [ ] `arm-linux-gnueabi-gcc --version` prints without error
-- [ ] `python3 extract_cramfs.py` ends with `Extraction complete.`
-- [ ] `./build-rootfs.sh` ends with `== done`
-- [ ] `~/rx3-rootfs/etc/rx3-ctl` contains `hw:0`
-- [ ] `readelf -h ~/rx3-fb-present | grep AArch64` prints a match
-- [ ] `~/Rx3-flx4/rx3-handoff/rx3.conf` contains `RX3_ROTATE=270`
-- [ ] `grep pgrep ~/Rx3-flx4/rx3-handoff/usb-hotplug.sh` shows `pgrep -f`
-- [ ] `mount | grep rx3-rootfs | grep asound` shows a bind mount
-- [ ] `~/rx3-up.sh` prints three non-empty PID lines and rotation 270
-- [ ] RX3 UI appears on the Duet's panel
-- [ ] Taps on on-screen buttons register (visible in `/tmp/touch.log` as
-      `touch begin ... region=N`, and the UI responds)
-- [ ] `systemctl is-enabled rx3.service` → `enabled`
-- [ ] `systemctl get-default` → `multi-user.target`
-- [ ] `/etc/udev/rules.d/99-rx3-usb.rules` exists
-- [ ] Plug a FAT32 stick → `sudo journalctl -t rx3 -f` shows `usb1 attached`
-- [ ] SOURCE → USB1 on the panel lists the stick's `PIONEER/` folder
-- [ ] After reboot, `pgrep -a rbp-pi` shows a process without manual start
-- [ ] `systemctl status rx3 --no-pager` shows all three processes in the cgroup
-
-Expected to be false (documented above, not bugs to fix):
-
-- [ ] Audio plays — the firmware engine stalls before writing, so nothing
-      is heard
-```
-
-The changes from the previous version:
-
-1. **Touch moved to ✅** in the "What works" table.
-2. **Removed the entire "Touch — firmware never opens the FIFO" section** from the failure analysis. It was wrong.
-3. **Renamed the failure section** to "What we know about the audio failure" — audio is the only remaining blocker.
-4. **Added the touch region caveat** to Known limitations — the bridge only handles regions it knows about, others are ignored.
-5. **Verification checklist** now includes a touch test as an expected-pass item.
-6. **"Expected to be false"** now has only one entry: audio.
-
-Save it as `~/README-DUET1.md`. If you want me to also update the installer to reflect any fix that came out of the touch debugging, tell me what actually changed between when touch didn't work and now — a reboot, a script run, something else — and I'll fold it in.# XDJ-RX3 Firmware Emulation on Lenovo Duet 1
-
-Running the Pioneer XDJ-RX3 v1.19 ARM32 firmware on a Lenovo Duet 1
-(MediaTek MT8183 / `google-krane`) under postmarketOS. Autostarts as a
-systemd service, renders to the built-in 1200×1920 DSI panel rotated 270°,
-and mounts hot-plugged USB sticks as rekordbox media.
-
-This is a port of the Pi 5 project at https://github.com/mutlisensor/Rx3-flx4
-to Alpine/musl + MediaTek hardware. It does not use the Raspberry Pi code
-paths unchanged — see "Alpine-specific changes" below.
-
----
-
-## Tested on
-
-| Component        | Value                                                |
-|------------------|------------------------------------------------------|
-| Device           | Lenovo Duet 1 (`google-krane`, MediaTek MT8183)      |
-| OS               | postmarketOS (Alpine-based, **systemd**)             |
-| Kernel           | 6.18.28-mt81 (aarch64 with CONFIG_COMPAT)            |
-| Display          | 1200×1920 DSI panel, `mediatekdrmfb`, 32bpp, stride 4800 |
-| Touchscreen      | `hid-over-i2c 27C6:0E30` (bare interface, no suffix) |
-| USB              | xHCI via MTU3, host mode on USB-C                    |
-| Audio card       | `mt8183_mt6358_ts3a227_max98357`, 48 kHz stereo only |
-| User             | `user` (uid 10000), home `/home/user`                |
-| Rotation         | 270° clockwise                                       |
-
-The kernel must have `CONFIG_COMPAT` (32-bit ARM execution). The installer
-tests this empirically with a freestanding armv7 binary.
-
----
-
-## Quick install
-
-```bash
-chmod +x ~/rx3-duet1-install.sh
-~/rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log
-```
-
-Idempotent — re-running skips completed steps. If `recover-firmware.py`
-hangs (it's interactive, sometimes the prompt is hidden behind `tee`),
-Ctrl+C and run it manually from `~/Rx3-flx4/rx3-handoff`, then re-run.
-
----
-
-## What works
-
-| Feature         | Status                                                |
-|-----------------|-------------------------------------------------------|
-| RX3 UI on panel | ✅ rotation 270, 1200×1920 native                     |
-| USB media       | ✅ FAT32 sticks mounted via fuse-overlayfs, firmware reads SOURCE → USB1 |
-| Autostart       | ✅ systemd `oneshot` with `KillMode=none`             |
-| Touch bridge    | ✅ reads taps, maps to regions, writes to FIFO        |
-| Touch in UI     | ❌ firmware never opens `/dev/tsc2007_2-0048`         |
-| Audio           | ❌ firmware engine stalls before writing to the PCM   |
-
----
-
-## Prerequisites
-
-The installer pulls these via `apk add`. Listed here for reference.
-
-```bash
-sudo apk add \
-    git bash \
-    build-base gcc g++ make patch linux-headers binutils \
-    gcc-armv7 binutils-armv7 musl-armv7 musl-dev-armv7 libstdc++-dev-armv7 \
-    fuse-overlayfs exfatprogs alsa-utils \
-    py3-pillow py3-cryptography \
-    rsync 7zip \
-    freetype-dev pkgconf font-dejavu libpng-dev \
-    strace lsof coreutils
-```
-
-The armv7 toolchain is installed as
-`armv7-alpine-linux-musleabihf-gcc` and symlinked to
-`arm-linux-gnueabi-gcc` in `/usr/local/bin`, because the upstream
-`build-rootfs.sh` hardcodes the Debian cross-compiler name. Kernel uapi
-headers (`asm`, `asm-generic`, `linux`) are symlinked from `/usr/include`
-into the armv7 sysroot.
-
----
-
-## Installation (manual, step by step)
-
-### 1. Clone and patch the repo
-
-```bash
-cd ~
-git clone https://github.com/mutlisensor/Rx3-flx4.git
-cd Rx3-flx4/rx3-handoff
-chmod +x *.sh
-```
-
-**Patch `build-rootfs.sh`** for the Alpine sysroot path:
-
-```bash
-sed -i 's|arm-linux-gnueabi-gcc -shared -fPIC|arm-linux-gnueabi-gcc --sysroot=/usr/armv7-alpine-linux-musleabihf -shared -fPIC|' build-rootfs.sh
-sed -i 's|apt install gcc-arm-linux-gnueabi|apk add gcc-armv7 musl-dev-armv7|' build-rootfs.sh
-```
-
-**Patch `patch-player.py`** to fix a NULL-pointer crash in
-`getPcController`. On the Duet, the global `IUiObjManager` singleton at
-`0x026867c0` is NULL when a JuceTimer fires, so the firmware dereferences
-NULL at offset 0x9c:
-
-```bash
-sed -i "s|(b/'rbp-pi').write_bytes(p)|# getPcController: return NULL instead of deref'ing a NULL singleton (JuceTimer fires before init).\nwords(0x31df70,0xe3a00000)\n(b/'rbp-pi').write_bytes(p)|" patch-player.py
-grep -n '31df70' patch-player.py
-```
-
-**Patch `usb-hotplug.sh`** — the upstream uses `pgrep -x rbp-pi`, which
-never matches the chroot-wrapped player. `pgrep -x` compares against the
-`comm` field (truncated to 15 chars, derived from the binary path).
-`pgrep -f` matches the full command line:
-
-```bash
-sed -i 's|pgrep -x rbp-pi|pgrep -f rbp-pi|' usb-hotplug.sh
-grep -n 'pgrep' usb-hotplug.sh
-```
-
-**Rewrite `asound.conf`** for the Duet's stereo internal card. Note `hw:0,0`
-not `plughw:0,0` — dmix rejects `plughw` as a slave with
-`snd_pcm_dmix_open) dmix plugin can be only connected to hw plugin`.
-And the rate is 48000 because the MT8183 card reports `RATE: 48000`
-(singular, not a range):
-
-```bash
-cp asound.conf asound.conf.orig
-cat > asound.conf <<'EOF'
-pcm.rx3mix {
- type dmix
- ipc_key 5396531
- ipc_key_add_uid true
- slave {
-  pcm "hw:0,0"
-  format S16_LE
-  rate 48000
-  channels 2
- }
- bindings { 0 0 1 1 }
-}
-pcm.rx3out { type plug  slave.pcm "rx3mix" }
-pcm.rx3cue { type plug  slave.pcm "rx3mix" }
-EOF
-```
-
-### 2. Recover the firmware
-
-You need a legitimate copy of the XDJ-RX3 v1.19 firmware. The scripts
-download it from AlphaTheta and decrypt it using the AES key from Pioneer's
-GPL source distribution.
-
-```bash
-python3 recover-firmware.py
-python3 extract_cramfs.py
-```
-
-Must finish with `Extraction complete.` If it doesn't, `runtime-symlinks.json`
-won't exist and the next step will fail.
-
-### 3. Build the chroot
-
-```bash
-./build-rootfs.sh 2>&1 | tee /tmp/build-rootfs.log
-```
-
-Expect `== done` and a size around 109 MB.
-
-### 4. Set up chroot runtime files
-
-```bash
-echo "hw:0" | sudo tee ~/rx3-rootfs/etc/rx3-ctl
-cp asound.conf ~/rx3-rootfs/etc/asound.conf
-sudo ./mount-rx3.sh
-sudo mkdir -p ~/rx3-rootfs/proc/asound
-sudo mount --bind /proc/asound ~/rx3-rootfs/proc/asound
-```
-
-The `/proc/asound` bind is required: the firmware enumerates card info
-through `/proc/asound/cards`, which doesn't exist inside the chroot
-otherwise. `mount-rx3.sh` doesn't set it up — it only mounts `/dev` and
-`/tmp`.
-
-### 5. Compile the host helper binaries
-
-These run natively (aarch64) on the Duet.
-
-```bash
-cd ~/Rx3-flx4/rx3-handoff
-
-gcc -O2 -DRX3_ROOT_PATH='"/home/user/rx3-rootfs"' \
-    -o ~/rx3-touch-bridge touch-bridge.c
-
-gcc -O2 -DRX3_ROOT_PATH='"/home/user/rx3-rootfs"' \
-    $(pkg-config --cflags freetype2) \
-    -o ~/rx3-fb-present fb-present.c \
-    $(pkg-config --libs freetype2)
-```
-
-Verify with `readelf`, NOT `file | grep aarch64` — the busybox `file`
-applet's output is not reliable for this check:
-
-```bash
-for b in ~/rx3-fb-present ~/rx3-touch-bridge; do
-    readelf -h "$b" | grep -E 'Class|Machine'
-done
-# Expect: Class: ELF64 / Machine: AArch64
-```
-
-### 6. Find the touch device
-
-The touchscreen is `hid-over-i2c 27C6:0E30` but the kernel creates **four**
-event interfaces with that base name:
-
-```
-event3   hid-over-i2c 27C6:0E30                ← bare, has ABS_MT ranges
-event4   hid-over-i2c 27C6:0E30 Stylus         ← zeroed ranges
-event5   hid-over-i2c 27C6:0E30 Stylus         ← no ABS_MT axes at all
-event6   hid-over-i2c 27C6:0E30 UNKNOWN        ← zeroed ranges
-```
-
-The bridge needs the bare one — the only one with real
-`ABS_MT_POSITION_X/Y` values. Auto-detect:
-
-```bash
-for e in /dev/input/event*; do
-    n=$(basename "$e")
-    name=$(cat /sys/class/input/$n/device/name 2>/dev/null)
-    [ "$name" = "hid-over-i2c 27C6:0E30" ] || continue
-    printf '=== %s (%s) ===\n' "$e" "$name"
-    sudo timeout 2 ~/rx3-touch-bridge "$e" ~/rx3-rootfs/dev/tsc2007_2-0048 2>&1 | head -1
-done
-```
-
-The correct device prints:
-
-```
-touch bridge: touchscreen, panel 1200x1920 rotate 90, canvas 1200x1920 at 0,0, touch 0..7200 x 0..11520
-```
-
-(the `rotate 90` is because `RX3_ROTATE` wasn't set; the service passes 270)
-
-The wrong ones print `touch ranges: Invalid argument`.
-
-**`eventN` numbers shuffle across reboots.** The udev symlink (step 10
-below) fixes this permanently.
-
-### 7. Set rotation
-
-```bash
-echo 'RX3_ROTATE=270' > ~/Rx3-flx4/rx3-handoff/rx3.conf
-```
-
-### 8. Autostart on boot (systemd)
-
-A `oneshot` service with `KillMode=none` launches the three processes
-without killing them when the script exits. See
-`/usr/local/bin/rx3-service.sh` and `/etc/systemd/system/rx3.service` in
-the installer.
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable rx3.service
-sudo systemctl set-default multi-user.target
-```
-
-**`systemctl set-default multi-user.target` is required.** Otherwise GDM
-grabs the DRM master first and the presenter can't draw.
-
-### 9. USB hotplug
-
-Two udev rules forward the partition add/remove events to `usb-hotplug.sh`,
-which calls `usb-attach.sh` to set up a fuse-overlayfs mount inside the
-chroot:
-
-```bash
-sudo mkdir -p /etc/udev/rules.d
-sudo tee /etc/udev/rules.d/99-rx3-usb.rules >/dev/null <<'EOF'
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_TYPE}!="", RUN+="/bin/sh -c '/usr/bin/systemd-run --no-block /home/user/Rx3-flx4/rx3-handoff/usb-hotplug.sh add %E{DEVNAME}'"
-ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", RUN+="/bin/sh -c '/usr/bin/systemd-run --no-block /home/user/Rx3-flx4/rx3-handoff/usb-hotplug.sh remove %E{DEVNAME}'"
-EOF
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger --action=add --subsystem-match=block
-```
-
-**`--action=add` is required.** Without it, `udevadm trigger` fires
-**`change`** actions and the rule (`ACTION=="add"`) never matches.
-
-Verify:
-
-```bash
-sudo journalctl -t rx3 -f    # in one terminal, then plug the stick in
-```
-
-Should show `rx3: usb1 attached /dev/sdb1`. Then on the panel: SOURCE → USB1.
-
-### 10. Stable touch symlink
-
-Stop `eventN` from shuffling. The rule uses `ATTRS{name}` (the kernel
-device name) and matches only the bare interface:
-
-```bash
-sudo mkdir -p /etc/udev/rules.d
-sudo tee /etc/udev/rules.d/99-rx3-touch.rules >/dev/null <<'EOF'
-ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="hid-over-i2c 27C6:0E30", SYMLINK+="input/rx3-touch"
-EOF
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger --action=add --subsystem-match=input
-sleep 1
-ls -la /dev/input/rx3-touch
-```
-
-If `/dev/input/rx3-touch → event3` appears, swap both scripts to use the
-symlink. **Note the `--action=add` again** — same reason as the USB rule.
-
----
-
-## Daily use
-
-| Task                            | Command                                   |
-|---------------------------------|-------------------------------------------|
-| Is it running?                  | `systemctl status rx3 --no-pager`         |
-| Restart                         | `sudo systemctl restart rx3`              |
-| Stop and get the desktop back   | `sudo systemctl stop rx3`                 |
-| Disable autostart               | `sudo systemctl disable rx3`              |
-| Manual start (no systemd)       | `~/rx3-up.sh`  — **run as user, NOT sudo** |
-| Player log                      | `tail -40 /tmp/player.log`                |
-| Presenter log                   | `tail -40 /tmp/present.log`               |
-| Touch log                       | `tail -40 /tmp/touch.log`                 |
-| USB attach/detach log           | `sudo journalctl -t rx3 -f`               |
-
----
-
-## Critical rules
-
-**Never run `build-rootfs.sh` while `mount-rx3.sh` mounts are active.**
-`build-rootfs.sh` uses `rsync --delete` and will fail partway through,
-destroying the chroot's `/dev/fb0` and never writing `/etc/rx3-ctl`. The
-installer guards against this by unmounting stale mounts before building.
-
-**Bind mounts don't survive reboot.** `rx3-service.sh` and `rx3-up.sh`
-both re-run `mount-rx3.sh` and re-bind `/proc/asound` at start.
-
-**postmarketOS's `sudo` does not support `-E`.** It prints
-`sudo: preserving the entire environment is not supported, '-E' is ignored`
-but the command still runs. Use the inline form `sudo VAR=val cmd`.
-
-**`~/rx3-up.sh` must not be run with `sudo`.** Under sudo, `~` expands to
-`/root`, so all paths break. The script calls `sudo` internally where
-needed. Always invoke it as your user.
-
-**`eventN` touch numbers shuffle across reboots.** The udev symlink in
-step 10 fixes this permanently.
-
-**USB sticks must be FAT32 or exFAT.** The kernel has vfat and exfat
-built in. NTFS is untested.
-
-**`pgrep -x rbp-pi` doesn't match the chroot-wrapped player.** The process
-`comm` field is truncated and derived from the binary path. `usb-hotplug.sh`
-uses `pgrep -f rbp-pi` instead, which matches the full command line.
-
-**`udevadm trigger` needs `--action=add`** to fire rules that match
-`ACTION=="add"`. Without it, it fires `change` and nothing happens.
-
-**Log files are created by root, which is why a user-run `rx3-up.sh` may
-fail with `Permission denied` on `/tmp/player.log`.** The installer and
-service pre-create them as `chmod 666`. If you create a custom launcher,
-do the same.
-
----
-
-## What we know about the two failures
-
-### Audio — firmware engine stalls before writing
-
-Facts established:
-
-- The firmware binary contains the strings `cs4344audio` and
-  `cs4344audiorev8`. It expects an ALSA card by that name — the Cirrus
-  CS4344 codec the real RX3 uses on its I2S bus.
-- `libfbshim.so` intercepts `snd_pcm_open` and redirects device names
-  ending in `0`/`1` to `rx3out`/`rx3cue`. It also intercepts `snd_ctl_open`
-  and forces `hw:0` (the value in `/etc/rx3-ctl`).
-- Adding a `snd_ctl_card_info` override to the shim that reports the card
-  name as `cs4344audiorev8` **does** start the engine — the log shows
-  `DjEngineIF::audioDeviceAboutToStart() bufferSize: 64 sampleRate: 44100`.
-- But the engine never writes. `strace` shows a permanent loop of
-  `SNDRV_PCM_IOCTL_SYNC_PTR` with zero `WRITEI_FRAMES`. `appl_ptr` stays
-  at 0 forever.
-- The firmware asks for 44100 internally; the Duet card is 48000 only.
-  `plug`/`rate` layers on top of dmix don't change the outcome.
-
-What we'd need: reverse-engineering `playengine::UsbAudio` and its callers
-in `rbp-pi` to find the check that gates the write loop. Ghidra + ARM32.
-Not a configuration fix.
-
-### Touch — firmware never opens the FIFO
-
-Facts established:
-
-- The touch bridge opens `/dev/input/event3` successfully, reads taps, maps
-  them to regions (`region=1`, `region=2`, etc.), and writes to
-  `/home/user/rx3-rootfs/dev/tsc2007_2-0048` (a FIFO created by
-  `mount-rx3.sh`).
-- `/tmp/touch.log` shows the bridge is doing its job perfectly.
-- But `lsof` on the player process shows it has **not** opened the FIFO.
-  `ls -la /proc/$PID/fd/ | grep tsc` returns nothing.
-
-The firmware never reads the touch input. Same class of problem as audio:
-a firmware-internal check for a device the Duet doesn't have, which can't
-be diagnosed from outside the binary.
-
-### DirectFB renderer race
-
-Some startups crash in `DS_HW_Core_Surface_DrawImage` at
-`rbp-pi + 0x19d6c4` (`systemd-coredump` shows it in thread `gui_task`).
-It's intermittent — the same binary runs for hours on other boots. It
-predates all audio work (crashed at 15:05 before any shim changes). If it
-happens, `sudo systemctl restart rx3` usually clears it.
-
----
-
-## Alpine-specific changes vs the original project
-
-| Original (Pi 5)                     | Duet 1 (Alpine)                                  |
-|-------------------------------------|--------------------------------------------------|
-| `apt` packages                       | `apk` packages (different names)                 |
-| `arm-linux-gnueabi-gcc` from Debian  | `armv7-alpine-linux-musleabihf-gcc` + symlink    |
-| Cross headers in compiler sysroot    | kernel uapi headers symlinked manually           |
-| `hw:2,0` (FLX4 USB audio)            | `hw:0,0` (MediaTek internal), 48 kHz stereo      |
-| `RX3_ROTATE` default 90              | 270                                              |
-| `systemd` unit as shipped            | needs `KillMode=none`                            |
-| `--userspec` in `chroot` (GNU)       | Alpine `chroot` is BusyBox; runs as root         |
-| Controller input (DDJ-FLX4 MIDI)     | none — touch only                                |
-| USB power-cycle via GPIO             | N/A on MT8183, removed                           |
-| `file \| grep aarch64` for verify    | `readelf -h \| grep AArch64`                     |
-| Touch device named once              | four `hid-over-i2c` interfaces; pick the bare one |
-| `pgrep -x rbp-pi` in hotplug         | `pgrep -f rbp-pi` (chroot-wrapped process)       |
-| `udevadm trigger` without action     | needs `--action=add` to match `ACTION=="add"`    |
-| No `/proc/asound` inside chroot      | bind `/proc/asound` manually                     |
-| asound.conf uses `hw:2,0`            | `hw:0,0` with rate 48000; **not** `plughw` (dmix rejects it) |
-
----
-
-## Known limitations
-
-- **No audio.** The firmware's audio engine starts (with a shim that fakes
-  the card name as `cs4344audiorev8`) but never writes to the PCM. This is
-  internal to `rbp-pi` and requires ARM32 reverse engineering to fix.
-- **No touch response in the UI.** The touch bridge reads taps and writes
-  to `/dev/tsc2007_2-0048`, but the firmware never opens that FIFO. Same
-  class of problem as audio.
-- **Intermittent DirectFB crash** in `DS_HW_Core_Surface_DrawImage` at
-  `rbp-pi+0x19d6c4`. Non-deterministic; restart usually clears it.
-- **High CPU.** The player spins in `poll()` at ~20% of one core. Wrap
-  with `cpulimit -l 50 -- chroot ...` if running long-term.
-- **NTFS USB untested.** Use FAT32 or exFAT.
-
----
-
-## Verification checklist
-
-After install, all of these should be true:
-
-- [ ] `/tmp/t32` prints `exit code: 42`
-- [ ] `arm-linux-gnueabi-gcc --version` prints without error
-- [ ] `python3 extract_cramfs.py` ends with `Extraction complete.`
-- [ ] `./build-rootfs.sh` ends with `== done`
-- [ ] `~/rx3-rootfs/etc/rx3-ctl` contains `hw:0`
-- [ ] `readelf -h ~/rx3-fb-present | grep AArch64` prints a match
-- [ ] `~/Rx3-flx4/rx3-handoff/rx3.conf` contains `RX3_ROTATE=270`
-- [ ] `grep pgrep ~/Rx3-flx4/rx3-handoff/usb-hotplug.sh` shows `pgrep -f`
-- [ ] `mount | grep rx3-rootfs | grep asound` shows a bind mount
-- [ ] `~/rx3-up.sh` prints three non-empty PID lines and rotation 270
-- [ ] RX3 UI appears on the Duet's panel
-- [ ] `systemctl is-enabled rx3.service` → `enabled`
-- [ ] `systemctl get-default` → `multi-user.target`
-- [ ] `/etc/udev/rules.d/99-rx3-usb.rules` exists
-- [ ] Plug a FAT32 stick → `sudo journalctl -t rx3 -f` shows `usb1 attached`
-- [ ] SOURCE → USB1 on the panel lists the stick's `PIONEER/` folder
-- [ ] After reboot, `pgrep -a rbp-pi` shows a process without manual start
-- [ ] `systemctl status rx3 --no-pager` shows all three processes in the cgroup
-
-Failures expected (documented above, not bugs to fix):
-
-- [ ] `tail /tmp/touch.log` shows `touch begin ... region=N` for taps, but
-      `sudo ls -la /proc/$(pgrep -f rbp-pi | head -1)/fd/ | grep tsc`
-      shows nothing — firmware doesn't read the FIFO
-- [ ] `grep audioDeviceAboutToStart /tmp/player.log` may show the line, but
-      `strace -p <pid> -e ioctl | grep -c WRITEI` returns 0
+**Paste the final `INSTALL COMPLETE` block and the `pgrep` output if anything fails** — every step logs clearly with `==>` headers so we can see exactly where it broke.
