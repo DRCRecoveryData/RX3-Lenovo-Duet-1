@@ -5,315 +5,402 @@ Duet 1 (MediaTek MT8183, `google-krane`, postmarketOS / Alpine + systemd).
 The aarch64 kernel's `CONFIG_COMPAT` executes 32-bit ARM directly —
 **no QEMU, no emulation**.
 
+## What works / what doesn't
+
+| Feature | Status |
+|---|---|
+| Firmware runs, UI renders (rotate 270°) | ✅ |
+| Touch overlay, auto-hide 8 s, swipe-up | ✅ |
+| USB hotplug (auto-mount) | ✅ |
+| Deck control (`rx3-control.py` over SSH) | ✅ |
+| Source switching, browsing, load/play/pause | ✅ |
+| **Audio output** | ❌ needs physical DDJ-FLX4 |
+| **Waveform animation** | ❌ driven by audio clock |
+| **BPM / tempo / time display** | ❌ driven by audio clock |
+| **Beat grid, hot cues, sync** | ❌ need audio position |
+
+Every ❌ is the same root cause: the firmware opens
+`hw:cs4344audiorev8,0/1/2` — a 4-channel I2S codec that lives inside the
+**physical DDJ-FLX4**. Without it, no audio clock exists, and all
+audio-derived visuals stay static. The Duet's internal mt8183 codec is
+stereo-only (`CHANNELS: 2` on every PCM), so aliasing can't fake it.
+
+The **only** fix is to connect a real DDJ-FLX4 over USB — the codec
+registers as a normal ALSA card and everything comes alive with zero
+code changes.
+
 ## Tested on
 
-| Component   | Value                                         |
-|-------------|-----------------------------------------------|
-| Device      | Lenovo Duet 1 (`google-krane`, MT8183)        |
-| OS          | postmarketOS (Alpine, systemd)                |
-| Kernel      | 6.18.28-mt81 (aarch64, CONFIG_COMPAT=y)       |
-| Display     | 1200×1920 DSI, `mediatekdrmfb`                |
-| Rotation    | 270° clockwise                                |
-| Touchscreen | `hid-over-i2c 27C6:0E30` (bare interface)     |
-| User        | `user` (uid 10000), home `/home/user`         |
+| Component   | Value                                   |
+|-------------|-----------------------------------------|
+| Device      | Lenovo Duet 1 (`google-krane`, MT8183)  |
+| OS          | postmarketOS (Alpine, systemd)          |
+| Kernel      | 6.18.28-mt81 (aarch64, `CONFIG_COMPAT=y`) |
+| Display     | 1200×1920 DSI, `mediatekdrmfb`          |
+| Rotation    | 270° clockwise                          |
+| Touchscreen | `hid-over-i2c 27C6:0E30`                |
+| User        | `user` (uid 10000)                      |
 
-## Quick install
+## Before you start
+
+Two ZIPs must be ready on disk:
+
+1. **XDJ-RX3 v1.19 update** — AlphaTheta support downloads
+2. **Pioneer GPL source distribution** — Pioneer's open-source page
+
+The installer pauses and asks for their paths.
+
+## One-shot install
 
 ```bash
 bash ~/rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log
 ```
 
-The installer pauses at firmware recovery. Have ready:
-1. **XDJ-RX3 v1.19 update** (.zip) from AlphaTheta support downloads
-2. **Pioneer GPL source distribution** (.zip) from Pioneer's open-source page
+Run as your normal user (NOT root). Idempotent — safe to re-run.
 
-After install:
+## Start / stop
 
 ```bash
-sudo systemctl start rx3
-sleep 15
-sudo systemctl start rx3-pointer
+# Enable + start both services
+sudo systemctl enable --now rx3 rx3-pointer
+
+# Check
 systemctl status rx3 rx3-pointer --no-pager | grep -E '●|Active:'
+pgrep -af 'rbp-pi|rx3-fb-present|rx3-touch-bridge'
+
+# Logs
+journalctl -u rx3 -f
+journalctl -u rx3-pointer -f
+tail -f ~/rx3-player.log
 ```
 
-On the Duet the firmware boots in ~15 s (native ARM32, no emulation).
+## Deck control — channel mapping
 
-## Features
+The `channel` argument is the **deck**, not a track index:
 
-| Feature | Status |
-|---------|--------|
-| RX3 UI on panel, rotation 270 | ✅ |
-| Touch input (overlay buttons) | ✅ |
-| Swipe-up to reveal overlay | ✅ |
-| Auto-hide overlay after 8 s | ✅ |
-| Keyboard control | ✅ |
-| USB hotplug | ✅ |
-| Autostart on boot | ✅ |
-| Audio | ❌ firmware gate — see below |
+| Channel | Meaning |
+|---|---|
+| `0` | global (source, crossfader) |
+| `1` | Deck 1 → `player0` |
+| `2` | Deck 2 → `player1` |
 
-### Overlay behavior
-
-- **Visible on boot** — the 12 buttons and 6 sliders
-- **Auto-hides 8 s** after your last touch
-- **Swipe up** on the screen to bring it back
-- While visible, buttons fire on tap; the timer resets on every touch
-- While hidden, the firmware UI runs fullscreen
-
-The overlay and the firmware share a byte at offset 48 of
-`~/rx3-rootfs/dev/rx3-ui-state`. The presenter reads it to decide
-whether to draw chrome; the touch bridge writes it.
-
-## Daily use
-
-| Task | Command |
-|------|---------|
-| Status | `systemctl status rx3 rx3-pointer --no-pager` |
-| Restart | `sudo systemctl restart rx3 && sleep 15 && sudo systemctl restart rx3-pointer` |
-| Stop | `sudo systemctl stop rx3-pointer rx3` |
-| Player log | `tail -40 /tmp/player.log` |
-| Touch log | `tail -20 ~/rx3-touch.log` |
-| Firmware state | `python3 ~/Rx3-flx4/rx3-handoff/rx3-control.py query` |
-
-### Keyboard control
+### Basic commands
 
 ```bash
 cd ~/Rx3-flx4/rx3-handoff
-C="python3 rx3-control.py"
 
-$C source;    sleep 1     # open SOURCE menu
-$C usb1;      sleep 1     # select USB1
-$C rotary +1; sleep 0.5   # scroll
-$C enter;     sleep 1     # enter folder
-$C load 0;    sleep 1     # load to deck 1
-$C play 0;    sleep 1     # play
-$C query                  # dump engine state
+# Source
+python3 rx3-control.py source
+python3 rx3-control.py usb1
+
+# Deck 1
+python3 rx3-control.py load 1
+python3 rx3-control.py play 1        # toggles play/pause
+python3 rx3-control.py CUE 1
+python3 rx3-control.py Sync 1
+
+# Deck 2
+python3 rx3-control.py load 2
+python3 rx3-control.py play 2
+
+# Mixer
+python3 rx3-control.py ChFader 1 0.8
+python3 rx3-control.py ChFader 2 0.8
+python3 rx3-control.py CrossFader 0 0.5
+
+# Query state
+python3 rx3-control.py query
 ```
 
-**Put ~0.5–1 second between commands.** The firmware drops rapid input.
+### Shell shortcuts
 
-### USB
+Add to `~/.profile`:
 
 ```bash
-ls /dev/sd*                  # find partition (sda1, sdb1, ...)
-# plug in a FAT32/exFAT stick
-sudo journalctl -t rx3 -f    # watch for "usb1 attached"
-python3 ~/Rx3-flx4/rx3-handoff/rx3-control.py mount usb1 /media/usb1/sdX1
+rx3() { cd ~/Rx3-flx4/rx3-handoff && python3 rx3-control.py "$@"; cd - >/dev/null; }
+rx3-both() { rx3 play 1; rx3 play 2; }
+rx3-stop() { rx3 play 1; rx3 play 2; }
 ```
 
-On the UI: **SOURCE → USB1**.
+Then: `rx3 query`, `rx3 usb1`, `rx3-both`, `rx3-stop`.
 
-## The seven patches that make it work
+## Touch overlay
 
-All baked into the installer. Listed here so you understand what's
-non-standard if you ever need to debug or re-apply.
+- Visible on boot; **auto-hides 8 s after last touch**
+- **Swipe up** (real drag ≥ 150 px in < 900 ms) to bring it back
+- Tap does not bring it back — must be a drag
+- 12 on-screen buttons for transport + rotary
 
-### 1. `patch-player.py` — `getPcController` NULL fix
+Tune in `~/Rx3-flx4/rx3-handoff/touch-bridge.c`:
 
-The upstream repo doesn't include this. Without it, the firmware segfaults
-at startup with `si_addr=0x9c` (NULL deref at offset 0x9c):
+- Auto-hide: `8000` (ms)
+- Swipe: `dy>150&&dt<900`
 
-```python
-words(0x31df70, 0xe3a00000)   # mov r0, #0
-```
-
-### 2. `control-shim.c` — input gate re-unlock
-
-`notify1stKeyHandled(manager, 3)` releases the firmware's startup input
-gate. On the Duet, the UI re-locks it after init. The shim now has a
-background `gate_thread` that re-calls it every 10 seconds, and calls it
-again before every `sendkey`.
-
-### 3. `rx3-control.py` — `op=0` for button press (Duet-specific)
-
-**This is the opposite of other machines.** On the Duet the firmware needs:
-
-```python
-send(k,0,ch); time.sleep(.1); send(k,2,ch)
-```
-
-Using `op=1` (which is correct on the Chuwi MiniBook and other x86_64 hosts)
-**resets the entire mixer state to 0.000** and corrupts the input handler.
-
-### 4. `fb-present.c` — `-hidable` flag
-
-Adds a `-hidable` flag: chrome (buttons + sliders) is drawn only when
-`state->overlay_visible` is set. The `idx[]` panel-to-canvas map is
-recomputed when the mode changes: letterboxed when chrome is drawn,
-fullscreen stretch when it's hidden.
-
-### 5. `touch-bridge.c` — swipe up + auto-hide
-
-- Records `y_min`/`y_max`/`t_start` on finger-down
-- On release: if `y_max - y_min > 250` and elapsed `< 700 ms` → sets
-  `overlay_visible = 1` (span is direction-agnostic, so up works)
-- Clears `overlay_visible` when `now - last_touch > 8000 ms`
-- Any finger-down while overlay is visible resets the timer
-
-### 6. `usb-attach.sh` — mknod hex→decimal
-
-Alpine's BusyBox `mknod` and Debian's coreutils both reject the `0x`
-prefix. The fix converts:
+Rebuild (note the escaped quotes for the macro):
 
 ```bash
-mknod $R/dev/$PART b $((16#$(stat -c %t "$SRC"))) $((16#$(stat -c %T "$SRC")))
-```
-
-### 7. `usb-hotplug.sh` — retry loop
-
-The upstream one-shot `rx3-control.py mount` call often misses because the
-FIFO isn't ready when udev fires. Now retries 15 times, 1 s apart, and logs
-`(mount event sent=1)` on success.
-
-## Audio limitation
-
-The firmware's audio engine opens an ALSA card named `cs4344audiorev8`
-(the Cirrus CS4344 DAC the real XDJ-RX3 uses). No such card exists on a
-laptop or tablet. The play state toggles correctly (`player0 playing=1`)
-but no audio samples reach any hardware.
-
-The **only** fix is a physical **Pioneer DDJ-FLX4** connected via USB —
-the project's `fbshim.c` redirects the firmware's ALSA calls to the
-controller's USB sound card. Without it, no sound.
-
-Fixing this without the controller would require Ghidra + ARM32
-reverse-engineering of `rbp-pi`.
-
-## Troubleshooting
-
-### Player segfaults at startup (`si_addr=0x9c`)
-
-The `getPcController` patch is missing. Verify:
-
-```bash
-arm-linux-gnueabi-objdump -d ~/rx3-rootfs/root/pdj/rbp-pi \
-    --start-address=0x31df6c --stop-address=0x31df78
-```
-
-Expect `31df70: e3a00000  mov r0, #0`.
-
-### `build-rootfs.sh` fails with `Permission denied` / `Resource busy`
-
-Stale bind mounts. Reboot or unmount manually:
-
-```bash
-sudo systemctl stop rx3 rx3-pointer
-sudo pkill -9 -f rbp-pi
-for m in $(mount | awk '/rx3-rootfs/ {print $3}' | sort -r); do
-    sudo umount -l "$m" 2>/dev/null || true
-done
-mount | grep rx3-rootfs   # should be empty
-./build-rootfs.sh
-```
-
-### `source` opens but nothing else works
-
-The firmware's input gate re-locked. Restart the player:
-
-```bash
-sudo systemctl restart rx3
-sleep 15
-```
-
-### `op=1` corruption
-
-If the mixer query shows `fader=0.000` after a button press, you're using
-`op=1`. Fix:
-
-```bash
-cd ~/Rx3-flx4/rx3-handoff
-sed -i '40s|send(k,1,ch)|send(k,0,ch)|' rx3-control.py
-```
-
-### Overlay doesn't auto-hide
-
-Check that the touch bridge is running and idle:
-
-```bash
-pgrep -af rx3-touch-bridge
-xxd -s 48 -l 4 ~/rx3-rootfs/dev/rx3-ui-state
-```
-
-`0000 0000` = hidden. `0100 0000` = visible. If it stays `0100 0000` with
-no touches, a finger's down flag is stuck — restart the bridge:
-
-```bash
+gcc -O2 -DRX3_ROOT_PATH="\"/home/user/rx3-rootfs\"" \
+    -o ~/rx3-touch-bridge ~/Rx3-flx4/rx3-handoff/touch-bridge.c
 sudo systemctl restart rx3-pointer
 ```
 
-### Swipe doesn't reveal overlay
+## USB
 
-The gesture must be a **drag**: finger down, slide across the screen,
-then lift. A tap won't trigger it. If drags don't work, check the log:
+**Plug in a FAT32 stick — it auto-mounts as USB1 (or USB2).**
 
-```bash
-tail -20 ~/rx3-touch.log
-```
+It does **not** auto-switch source — you control when the RX3 reads from
+USB instead of its internal library.
 
-Look for `touch begin` lines. If they appear but the overlay stays hidden,
-the touch threshold (250 canvas pixels) is too high — lower it in
-`touch-bridge.c` and rebuild.
+Auto-mount chain: udev `99-rx3-usb.rules` → `systemd-run` →
+`usb-hotplug.sh` → `usb-attach.sh` → `rx3-control.py mount`.
 
-## Backup
-
-After a working install:
+Watch:
 
 ```bash
-ls -la ~/rx3-final/
+sudo journalctl -t rx3 -f
 ```
 
-Contains: source files, compiled binaries, service unit, and `rx3.conf`.
-Copy `~/rx3-final/` and `~/rx3-duet1-install.sh` to a USB stick or cloud.
+Expected: `usb1 attached /dev/sdb1 (mount event sent=1)`
 
-## Machine comparison
+Play from it:
 
-| Machine | Arch | Firmware runs via | Buttons op | Notes |
-|---------|------|-------------------|-----------|-------|
-| **Duet 1** | ARM64 | native CONFIG_COMPAT | **0** | fast; op=1 corrupts mixer |
-| Chuwi MiniBook | x86_64 | QEMU ARM32 | 1 | slow; op=0 silently ignored |
-| Lenovo laptops | x86_64 | QEMU ARM32 | 1 | same as Chuwi |
-| Pi 4 + 5" DSI | ARM64 | native CONFIG_COMPAT | 0 | 800×480 panel, UI text small |
-| Pi 5 + 7" | ARM64 | native CONFIG_COMPAT | 0 | project's target hardware |
+```bash
+cd ~/Rx3-flx4/rx3-handoff
+python3 rx3-control.py source
+python3 rx3-control.py usb1
+python3 rx3-control.py load 1
+python3 rx3-control.py play 1
+```
+
+## SSH
+
+```bash
+sudo apk add openssh
+sudo systemctl enable --now sshd
+sudo passwd user               # if not set
+ip -4 addr show | grep inet    # get IP
+```
+
+From another machine:
+
+```bash
+ssh user@<ip>
+```
+
+Root login is disabled by default in Alpine's sshd — log in as `user`
+and `sudo` from there.
+
+## Mode switching
+
+Installer sets boot to `multi-user.target` (console, RX3 owns the
+framebuffer). To use a desktop instead:
+
+```bash
+cd ~/Rx3-flx4/rx3-handoff
+./install.sh desktop
+sudo apk add postmarketos-ui-phosh
+sudo reboot
+```
+
+Back to RX3:
+
+```bash
+cd ~/Rx3-flx4/rx3-handoff
+./install.sh
+sudo systemctl enable --now rx3 rx3-pointer
+```
+
+If GNOME/GDM keeps holding the framebuffer:
+
+```bash
+sudo systemctl stop gdm
+sudo systemctl restart rx3 rx3-pointer
+```
+
+## Troubleshooting
+
+### `MISS no TrueType font` in upstream install.sh
+
+Alpine puts DejaVu in `/usr/share/fonts/dejavu/`, upstream checks
+`/usr/share/fonts/truetype/*/*.ttf`. The installer symlinks it. If it
+fails:
+
+```bash
+sudo mkdir -p /usr/share/fonts/truetype
+sudo ln -sfn /usr/share/fonts/dejavu /usr/share/fonts/truetype/dejavu
+```
+
+### `install: target '/etc/udev/rules.d/': No such file or directory`
+
+```bash
+sudo mkdir -p /etc/udev/rules.d
+```
+
+### `error: redefinition of 'noborder'` / `'overlay_last_touch'`
+
+The patch script re-applied to already-patched source. Restore and rerun:
+
+```bash
+cd ~/Rx3-flx4
+git checkout -- rx3-handoff/
+bash ~/rx3-duet1-install.sh
+```
+
+### Overlay never auto-hides
+
+Check the presenter got `-hidable`:
+
+```bash
+grep rx3-fb-present ~/Rx3-flx4/rx3-handoff/rx3-start.sh
+# must show: rx3-fb-present -hidable $R/dev/fb0
+```
+
+Fix + restart:
+
+```bash
+sed -i 's|rx3-fb-present \$R/dev/fb0|rx3-fb-present -hidable $R/dev/fb0|' \
+    ~/Rx3-flx4/rx3-handoff/rx3-start.sh
+sudo systemctl restart rx3
+```
+
+### Swipe-up does not work
+
+Watch the state file:
+
+```bash
+xxd ~/rx3-rootfs/dev/rx3-ui-state
+```
+
+Last 4 bytes: `01000000` = shown, `00000000` = hidden. Touch → should
+flip to `01…`; wait 8 s → `00…`. If nothing flips, the bridge isn't
+seeing touch events. Check the device it opened:
+
+```bash
+pgrep -af rx3-touch-bridge
+journalctl -u rx3-pointer -n 30 --no-pager
+for e in /dev/input/event*; do
+  echo "$e: $(cat /sys/class/input/$(basename $e)/device/name 2>/dev/null)"
+done
+```
+
+Bridge must be on the device named `hid-over-i2c 27C6:0E30`.
+
+### USB stick doesn't auto-mount
+
+```bash
+# 1. Partition + FS
+lsblk -f
+sudo blkid /dev/sdb1
+
+# 2. udev fired?
+sudo journalctl -b --no-pager | grep usb-hotplug | tail
+
+# 3. Script logged success?
+sudo journalctl -t rx3 -b --no-pager | tail
+
+# 4. Player running? (hotplug bails if not)
+pgrep -af rbp-pi
+
+# 5. Mount visible?
+mount | grep sdb
+ls ~/rx3-rootfs/media/usb1/
+```
+
+Expected in #3: `usb1 attached /dev/sdb1 (mount event sent=1)`.
+
+If #2 shows the script launched but #3 is empty, the script exited
+early. Most common cause was `pgrep -x rbp-pi` failing — the installer
+uses `pgrep -f rbp-pi`. Verify:
+
+```bash
+grep pgrep ~/Rx3-flx4/rx3-handoff/usb-hotplug.sh
+```
+
+Should show `pgrep -f rbp-pi`.
+
+### No audio, static waveform, no BPM
+
+Expected — hardware limit. See the top of this README. Only a physical
+DDJ-FLX4 fixes it.
+
+The `CTL open hw:CARD=Loopback ffffffed` and `PCM open … ffffffed`
+lines in `~/rx3-player.log` are harmless attempts at a fallback. The
+player still runs.
+
+### SSH hangs / refuses
+
+```bash
+systemctl status sshd --no-pager
+sudo apk add openssh
+sudo systemctl enable --now sshd
+sudo passwd user
+```
+
+## Files
+
+| Path | Purpose |
+|---|---|
+| `~/rx3-duet1-install.sh` | Installer |
+| `~/Rx3-flx4/` | Upstream player repo |
+| `~/Rx3-flx4/rx3-handoff/` | Patch + build scripts, patched sources |
+| `~/rx3-rootfs/` | ~109 MB chroot with ARM32 firmware |
+| `~/rx3-usb/` | Copy-on-write overlays for USB1/USB2 |
+| `~/rx3-fb-present` | Presenter binary |
+| `~/rx3-touch-bridge` | Touch bridge binary |
+| `~/rx3-final/` | Backup of working sources, binaries, rules |
+| `~/rx3-install.log` | Full install log |
+| `~/rx3-player.log` | Player stdout/stderr |
+| `/etc/systemd/system/rx3.service` | Player unit |
+| `/etc/systemd/system/rx3-pointer.service` | Touch bridge unit |
+| `/etc/udev/rules.d/99-rx3-usb.rules` | USB hotplug rule |
+| `/etc/udev/rules.d/99-rx3-touch.rules` | Touch symlink rule |
+
+## Restoring after a re-install
+
+Working files are in `~/rx3-final/`:
+
+```bash
+cp ~/rx3-final/touch-bridge.c ~/rx3-final/rx3-start.sh \
+   ~/rx3-final/asound.conf   ~/rx3-final/usb-hotplug.sh \
+   ~/Rx3-flx4/rx3-handoff/
+gcc -O2 -DRX3_ROOT_PATH="\"/home/user/rx3-rootfs\"" \
+    -o ~/rx3-touch-bridge ~/Rx3-flx4/rx3-handoff/touch-bridge.c
+sudo cp ~/rx3-final/99-rx3-usb.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo systemctl restart rx3 rx3-pointer
+```
+
+## Rebuilding rbp-pi from source
+
+If `rbp-pi` gets corrupted:
+
+```bash
+sudo cp ~/Rx3-flx4/rx3-handoff/rbp-pi ~/rx3-rootfs/root/pdj/rbp-pi
+sudo systemctl restart rx3
+```
+
+Or restore the last-known-good binary:
+
+```bash
+sudo cp ~/rx3-rootfs/root/pdj/rbp-pi.orig ~/rx3-rootfs/root/pdj/rbp-pi
+```
 ```
 
 ---
 
-## Install
+**Save both files:**
 
 ```bash
+nano ~/rx3-duet1-install.sh    # paste script, Ctrl+O, Enter, Ctrl+X
 chmod +x ~/rx3-duet1-install.sh
-~/rx3-duet1-install.sh 2>&1 | tee ~/rx3-install.log
+nano ~/README.md               # paste readme, save
 ```
 
-Have the firmware `.zip` files ready — it pauses at step 7.
-
-The installer:
-1. Installs Alpine packages
-2. Symlinks `armv7-*` toolchain → `arm-linux-gnueabi-*`
-3. Symlinks kernel uapi headers into the armv7 sysroot
-4. Tests 32-bit ARM execution
-5. Clones the repo
-6. **Patches all eight source files in one Python block** (patch-player.py, build-rootfs.sh, control-shim.c, pi-controls.h, fb-present.c, touch-bridge.c, rx3-control.py, usb-attach.sh, usb-hotplug.sh)
-7. Recovers firmware (interactive)
-8. Builds the chroot
-9. Binds `/proc/asound`
-10. Compiles `rx3-fb-present` and `rx3-touch-bridge`
-11. Runs upstream `install.sh` for the systemd unit and udev rules
-12. Installs `rx3-pointer.service` with auto-detect
-13. Saves everything to `~/rx3-final/`
-
-Every patch has an idempotent check — re-running is safe. If a pattern doesn't match (because the upstream file changed), the patcher reports `MISS: filename:tag` and continues, so you can see exactly what failed.
-
-## After install
+**One last backup of everything working:**
 
 ```bash
-sudo systemctl start rx3
-sleep 15
-sudo systemctl start rx3-pointer
-
-systemctl status rx3 rx3-pointer --no-pager | grep -E '●|Active:'
-pgrep -af 'rbp-pi|rx3-fb-present|rx3-touch-bridge'
-```
-
-Three processes; UI on the panel; overlay visible; swipe up works.
-
-**Paste the final `INSTALL COMPLETE` block and the `pgrep` output if anything fails** — every step logs clearly with `==>` headers so we can see exactly where it broke.
+mkdir -p ~/rx3-final
+cp ~/Rx3-flx4/rx3-handoff/touch-bridge.c ~/Rx3-flx4/rx3-handoff/rx3-start.sh ~/Rx3-flx4/rx3-handoff/asound.conf ~/Rx3-flx4/rx3-handoff/usb-hotplug.sh ~/Rx3-flx4/rx3-handoff/rbp-pi ~/rx3-final/
+sudo cp /etc/udev/rules.d/99-rx3-usb.rules /etc/udev/rules.d/99-rx3-touch.rules /etc/systemd/system/rx3.service /etc/systemd/system/rx3-pointer.service ~/rx3-final/
+cp ~/rx3-duet1-install.sh ~/README.md ~/rx3-final/
+ls -la ~/rx3-final/
