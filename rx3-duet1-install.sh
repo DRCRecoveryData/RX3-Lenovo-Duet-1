@@ -34,6 +34,14 @@ echo "  fb:   $(cat /sys/class/graphics/fb0/name 2>/dev/null) $(cat /sys/class/g
 echo
 
 # ------------------------------------------------------------------
+# 0. Ensure system prerequisites like udev directories exist on Alpine
+# ------------------------------------------------------------------
+say "Preparing system directories"
+sudo mkdir -p /etc/udev/rules.d /etc/systemd/system /usr/share/fonts/truetype/dejavu
+sudo ln -sf /usr/share/fonts/dejavu/*.ttf /usr/share/fonts/truetype/dejavu/ 2>/dev/null || true
+ok "directories and font symlinks ready"
+
+# ------------------------------------------------------------------
 # 1. Clean previous install (safe to skip if none exists)
 # ------------------------------------------------------------------
 say "Cleaning any previous install"
@@ -65,8 +73,6 @@ sudo udevadm control --reload-rules 2>/dev/null || true
 
 rm -rf "$ROOT" "$HOME/rx3-usb" "$HOME/rx3-fb-present" "$HOME/rx3-touch-bridge"
 rm -f  "$HOME/rx3-player.log" "$HOME/rx3-controller.log" "$HOME/rx3-present.log" "$HOME/rx3-touch.log" "$HOME/rx3-usb.log"
-# Keep $WORK if you want to reuse; delete for a fully clean start:
-# rm -rf "$WORK"
 
 ok "previous install removed"
 
@@ -143,7 +149,6 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 unzip -o -q "$ZIP" -d "$WORK"
 
-# The zip contains Rx3-flx4/... — flatten into $WORK so paths match upstream
 if [ -d "$WORK/Rx3-flx4" ] && [ ! -d "$WORK/rx3-handoff" ]; then
     mv "$WORK/Rx3-flx4"/* "$WORK/" 2>/dev/null || true
     mv "$WORK/Rx3-flx4"/.[!.]* "$WORK/" 2>/dev/null || true
@@ -217,7 +222,6 @@ say "Building chroot"
 ./build-rootfs.sh 2>&1 | tee /tmp/build.log
 grep -q '^== done' /tmp/build.log || die "build-rootfs.sh failed"
 
-# Verify the crash fix landed in the chroot binary
 python3 - <<PYEOF
 from pathlib import Path
 b = Path("$ROOT/root/pdj/rbp-pi").read_bytes()
@@ -228,33 +232,31 @@ if w != 0xe3a00000:
 PYEOF
 
 # ------------------------------------------------------------------
-# 12. Tune asound.conf for the Duet's slow CPU (avoids cue underrun)
+# 12. Tune asound.conf for the Duet's slow CPU
 # ------------------------------------------------------------------
 say "Tuning asound.conf buffer sizes"
 sed -i 's/period_size 128/period_size 1024/; s/buffer_size 512/buffer_size 8192/' "$HANDOFF/asound.conf"
 grep -E 'period_size|buffer_size' "$HANDOFF/asound.conf"
-# Apply to chroot copy if the build already placed one
 [ -f "$ROOT/etc/asound.conf" ] && sudo sed -i 's/period_size 128/period_size 1024/; s/buffer_size 512/buffer_size 8192/' "$ROOT/etc/asound.conf" || true
 ok "buffer sizes updated"
 
 # ------------------------------------------------------------------
-# 13. Host install (builds helpers, installs service, udev, cursor, PipeWire mask)
+# 13. Host install
 # ------------------------------------------------------------------
 say "Running upstream install.sh"
 ./install.sh 2>&1 | tee /tmp/install.log
 ok "host install complete"
 
 # ------------------------------------------------------------------
-# 14. Add user to input group (needed for the touch bridge)
+# 14. Add user to input group
 # ------------------------------------------------------------------
 say "Adding $(id -un) to 'input' group"
 sudo adduser "$(id -un)" input 2>/dev/null || sudo usermod -aG input "$(id -un)" 2>/dev/null || true
 id "$(id -un)" | grep -q input && ok "in input group" || warn "group change requires logout to take effect"
-# Make the current session pick up the group too
 sg input -c 'true' 2>/dev/null || true
 
 # ------------------------------------------------------------------
-# 15. rx3-pointer.service (the new zip doesn't install one)
+# 15. rx3-pointer.service
 # ------------------------------------------------------------------
 say "Creating rx3-pointer.service for the Duet touchscreen"
 
@@ -311,17 +313,11 @@ Check:
   systemctl status rx3 rx3-pointer --no-pager | grep -E 'Active|●'
   pgrep -af 'rbp-pi|rx3-fb-present|rx3-touch-bridge'
 
-If touch doesn't respond, log out and back in (or reboot) so the
-'input' group takes effect for your session, then:
-
-  sudo systemctl restart rx3 rx3-pointer
-
 Logs:
   journalctl -u rx3 -f
   tail -f ~/rx3-player.log
   tail -f ~/rx3-touch.log
 EOF
-
 RX3_PMOS_EOF
 
 chmod +x ~/rx3-duet1-pmos.sh
