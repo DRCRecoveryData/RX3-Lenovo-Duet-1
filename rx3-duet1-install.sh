@@ -232,13 +232,13 @@ if w != 0xe3a00000:
 PYEOF
 
 # ------------------------------------------------------------------
-# 12. Tune asound.conf for the Duet's slow CPU
+# 12. Tune asound.conf buffer sizes for robust audio (16384 buffer)
 # ------------------------------------------------------------------
 say "Tuning asound.conf buffer sizes"
-sed -i 's/period_size 128/period_size 1024/; s/buffer_size 512/buffer_size 8192/' "$HANDOFF/asound.conf"
+sed -i 's/period_size 128/period_size 1024/; s/buffer_size 512/buffer_size 16384/' "$HANDOFF/asound.conf"
 grep -E 'period_size|buffer_size' "$HANDOFF/asound.conf"
-[ -f "$ROOT/etc/asound.conf" ] && sudo sed -i 's/period_size 128/period_size 1024/; s/buffer_size 512/buffer_size 8192/' "$ROOT/etc/asound.conf" || true
-ok "buffer sizes updated"
+[ -f "$ROOT/etc/asound.conf" ] && sudo sed -i 's/period_size 128/period_size 1024/; s/buffer_size 512/buffer_size 16384/' "$ROOT/etc/asound.conf" || true
+ok "buffer sizes updated (1024 / 16384)"
 
 # ------------------------------------------------------------------
 # 13. Host install
