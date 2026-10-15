@@ -36,7 +36,6 @@ say "Preparing system directories and USB power rules"
 sudo mkdir -p /etc/udev/rules.d /etc/systemd/system /usr/share/fonts/truetype/dejavu
 sudo ln -sf /usr/share/fonts/dejavu/*.ttf /usr/share/fonts/truetype/dejavu/ 2>/dev/null || true
 
-# Prevent FLX4 USB autosuspend disconnects
 sudo tee /etc/udev/rules.d/50-flx4-power.rules >/dev/null <<'EOF'
 ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="2b73", ATTR{power/control}="on"
 EOF
@@ -129,7 +128,7 @@ PYEOF
 ok "crash fix applied"
 
 # ------------------------------------------------------------------
-# 7. Configs (Rotation & Stock Audio)
+# 7. Configs (Rotation)
 # ------------------------------------------------------------------
 say "Writing configurations"
 cat > rx3.conf <<EOF
@@ -157,7 +156,6 @@ say "Running upstream install.sh"
 
 sudo adduser "$(id -un)" input 2>/dev/null || sudo usermod -aG input "$(id -un)" 2>/dev/null || true
 
-# Create touch bridge service
 sudo tee /etc/systemd/system/rx3-pointer.service >/dev/null <<EOF
 [Unit]
 Description=RX3 touch bridge (Duet 1 hid-over-i2c panel)
