@@ -2,12 +2,11 @@ cat > ~/rx3-duet1-pmos.sh <<'RX3_PMOS_EOF'
 #!/bin/bash
 # rx3-duet1-pmos.sh — Rx3-flx4 install for Lenovo Duet 1 (MT8183, google-krane)
 # Target: postmarketOS / Alpine + systemd.
-# Uses mainstream repo: https://github.com/mutlisensor/Rx3-flx4
+# Uses direct repository clone: https://github.com/mutlisensor/Rx3-flx4.git
 
 set -euo pipefail
 
 REPO="https://github.com/mutlisensor/Rx3-flx4.git"
-REPO_DIR="$HOME/Rx3-flx4"
 WORK="$HOME/Rx3-flx4"
 HANDOFF="$WORK/rx3-handoff"
 ROOT="$HOME/rx3-rootfs"
@@ -105,19 +104,14 @@ done
 ok "headers linked"
 
 # ------------------------------------------------------------------
-# 5. Repo + zip extraction
+# 5. Clone repository directly
 # ------------------------------------------------------------------
-say "Fetching repo and extracting zip"
-git clone "$REPO" "$REPO_DIR"
-
-ZIP="$REPO_DIR/Rx3-flx4.zip"
-[ -f "$ZIP" ] || die "Rx3-flx4.zip not found"
-
-mkdir -p "$WORK"
-unzip -o -q "$ZIP" -d "$WORK"
+say "Cloning repository"
+git clone "$REPO" "$WORK"
+[ -d "$HANDOFF" ] || die "rx3-handoff directory not found in repository"
 cd "$HANDOFF"
 chmod +x *.sh
-ok "extracted to $HANDOFF"
+ok "repository cloned to $WORK"
 
 # ------------------------------------------------------------------
 # 6. Patch player crash fix
@@ -143,7 +137,7 @@ RX3_ROTATE=$ROTATE
 RX3_FPS=30
 RX3_FILTER=nearest
 EOF
-ok "configurations written (stock audio layout preserved)"
+ok "configurations written"
 
 # ------------------------------------------------------------------
 # 8. Firmware Recovery & Build Chroot
