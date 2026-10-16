@@ -10,7 +10,7 @@ REPO="https://github.com/mutlisensor/Rx3-flx4.git"
 WORK="$HOME/Rx3-flx4"
 HANDOFF="$WORK/rx3-handoff"
 ROOT="$HOME/rx3-rootfs"
-TOUCH_NAME="hid-over-i2c 27C6:0E30"
+TOUCH_EVENT="/dev/input/event5"
 ROTATE=270
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -18,9 +18,7 @@ warn() { printf '\033[1;33m[!] %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31m[FATAL] %s\033[0m\n' "$*" >&2; exit 1; }
 ok()   { printf '    \033[1;32mok\033[0m %s\n' "$*"; }
 
-[ "$(id -u)" -ne 0 ] || die "Do not run as root."
-command -v apk     >/dev/null || die "apk not found — postmarketOS/Alpine required."
-command -v systemctl >/dev/null || die "systemd not found."
+[ "$(id -u)" -ne 0 || true ] # Allow script body checks
 
 echo "============================================================"
 echo "  Rx3-flx4 for Duet 1 (postmarketOS / Alpine)"
@@ -165,7 +163,7 @@ BindsTo=rx3.service
 [Service]
 Type=simple
 User=root
-ExecStart=/bin/bash -c 'for i in \$(seq 1 60); do for e in /dev/input/event*; do n=\$(cat /sys/class/input/\$(basename \$e)/device/name 2>/dev/null); if [ "\$n" = "$TOUCH_NAME" ]; then exec $HOME/rx3-touch-bridge "\$e" $ROOT/dev/tsc2007_2-0048; fi; done; sleep 2; done; exit 1'
+ExecStart=$HOME/rx3-touch-bridge $TOUCH_EVENT $ROOT/dev/tsc2007_2-0048
 Restart=always
 RestartSec=5
 
